@@ -1,0 +1,21 @@
+schema_version = "1.0.0"
+
+id = "mechassault2_importer"
+version = "1.0.0"
+name = "MechAssault 2 Importer"
+tagline = "Import MechAssault 2 models, materials, animations, and maps"
+maintainer = "MechAssault2-Blender Contributors"
+type = "add-on"
+
+blender_version_min = "5.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+tags = [
+  "Import-Export",
+]
+
+[permissions]
+files = "Import MechAssault 2 assets and read MGF archives from disk"
