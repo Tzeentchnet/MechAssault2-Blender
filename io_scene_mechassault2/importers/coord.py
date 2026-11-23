@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 from mathutils import Euler, Matrix, Quaternion, Vector
@@ -163,17 +163,58 @@ def entity_matrix_to_blender(
     return SWAP_YZ @ m_col @ SWAP_YZ
 
 
+#: MA2 game-space right, up and back vectors (as matrix columns: right = -X, up = +Y, back = +Z).
+#: Derived from atlas.NODE vs atl_skeleton.gr2: a Max point (gx, gy, gz) lands at MA2 (-gx, gz, -gy).
+_MA2_RIGHT_UP_BACK = np.array(((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)), dtype=np.float64).T
+
+_SWAP_YZ_NP = np.array(((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, 1.0, 0.0)), dtype=np.float64)
+
+
+def gr2_basis_to_blender(axes: Optional[Sequence[Sequence[float]]]) -> np.ndarray:
+    """3x3 orthogonal matrix K mapping a Granny2 file-space vector to Blender space (v_bl = K @ v_gr2).
+
+    `axes` is the file's ArtToolInfo (RightVector, UpVector, BackVector). Every MA2 asset exported from
+    3D Studio MAX is Z-up (right +X, up +Z, back -Y). Without ArtToolInfo the data is assumed to
+    already be in MA2 game space (Y-up), which is the legacy behaviour.
+    """
+    if not axes:
+        return _SWAP_YZ_NP.copy()
+    src = np.array(axes, dtype=np.float64).T  # columns: right, up, back in file space
+    try:
+        src_inv = np.linalg.inv(src)
+    except np.linalg.LinAlgError:
+        return _SWAP_YZ_NP.copy()
+    k = _SWAP_YZ_NP @ _MA2_RIGHT_UP_BACK @ src_inv
+    # Snap to a clean signed permutation when the input is axis-aligned
+    return np.where(np.abs(k) < 1e-6, 0.0, k)
+
+
 def gr2_trs_to_blender_matrix(
     pos: Sequence[float],
     rot_xyzw: Sequence[float],
     scale_shear_3x3: Sequence[float],
     world_scale: float = 1.0,
+    axes: Optional[Sequence[Sequence[float]]] = None,
 ) -> Matrix:
     """Convert a Granny2 transform (pos3, rot4 xyzw, scale_shear 9 floats row-major) to Blender Matrix.
 
     In Granny2, local transform applies scale_shear, then rotation, then translation:
-    M_ma2 = T(pos) * R(rot) * S(scale_shear).
+    M_gr2 = T(pos) * R(rot) * S(scale_shear). The result is K * M_gr2 * K^T with K from
+    `gr2_basis_to_blender(axes)`.
     """
+    if axes:
+        k = Matrix(gr2_basis_to_blender(axes).tolist()).to_4x4()
+        ss = scale_shear_3x3
+        m = (
+            Matrix.Translation(Vector((float(pos[0]), float(pos[1]), float(pos[2]))))
+            @ Quaternion((float(rot_xyzw[3]), float(rot_xyzw[0]), float(rot_xyzw[1]), float(rot_xyzw[2])))
+            .normalized().to_matrix().to_4x4()
+            @ Matrix(((ss[0], ss[1], ss[2], 0.0), (ss[3], ss[4], ss[5], 0.0), (ss[6], ss[7], ss[8], 0.0), (0.0, 0.0, 0.0, 1.0)))
+        )
+        out = k @ m @ k.transposed()
+        out.translation = out.translation * world_scale
+        return out
+
     loc = Vector(pos_to_blender(float(pos[0]), float(pos[1]), float(pos[2]), world_scale))
     rot = quat_xyzw_to_blender(float(rot_xyzw[0]), float(rot_xyzw[1]), float(rot_xyzw[2]), float(rot_xyzw[3]))
     # Convert 3x3 scale-shear matrix via C * S * C (swap Y and Z rows/cols)

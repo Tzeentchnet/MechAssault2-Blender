@@ -67,6 +67,8 @@ class Gr2Skeleton:
     name: str
     bones: List[Gr2Bone] = field(default_factory=list)
     lod_type: int = 0
+    # Source-tool axis system from ArtToolInfo: (right, up, back) vectors, or None if absent
+    axes: Optional[Tuple[Tuple[float, float, float], ...]] = None
 
 
 @dataclass
@@ -105,11 +107,13 @@ class Gr2Animation:
     default_loop_count: int = 0
     flags: int = 0
     track_groups: List[Gr2TrackGroup] = field(default_factory=list)
+    axes: Optional[Tuple[Tuple[float, float, float], ...]] = None
 
 
 @dataclass
 class Gr2File:
     version: int = 6
+    axes: Optional[Tuple[Tuple[float, float, float], ...]] = None
     skeletons: List[Gr2Skeleton] = field(default_factory=list)
     animations: List[Gr2Animation] = field(default_factory=list)
     track_groups: List[Gr2TrackGroup] = field(default_factory=list)
@@ -689,7 +693,7 @@ class _Gr2Reader:
 
     def parse(self) -> Gr2File:
         root = self._read_struct(self.type_ref, self.root_ref)
-        gr2 = Gr2File(version=self.version)
+        gr2 = Gr2File(version=self.version, axes=self._read_art_tool_axes(root.get("ArtToolInfo")))
 
         # Skeletons
         if "Skeletons" in root:
@@ -717,6 +721,7 @@ class _Gr2Reader:
                         name=str(sobj.get("Name") or f"Skeleton_{len(gr2.skeletons)}"),
                         bones=bones,
                         lod_type=int(sobj.get("LODType", 0)),
+                        axes=gr2.axes,
                     )
                 )
 
@@ -759,10 +764,26 @@ class _Gr2Reader:
                         default_loop_count=int(aobj.get("DefaultLoopCount", 0)),
                         flags=int(aobj.get("Flags", 0)),
                         track_groups=tgs,
+                        axes=gr2.axes,
                     )
                 )
 
         return gr2
+
+    def _read_art_tool_axes(self, ati_field: Any) -> Optional[Tuple[Tuple[float, float, float], ...]]:
+        """Read (RightVector, UpVector, BackVector) from the root ArtToolInfo reference, if present."""
+        if not (isinstance(ati_field, tuple) and len(ati_field) == 2 and ati_field[1] is not None):
+            return None
+        ati = self._read_struct(ati_field[0], ati_field[1])
+        vecs = []
+        for key in ("RightVector", "UpVector", "BackVector"):
+            v = ati.get(key)
+            if not (isinstance(v, tuple) and len(v) == 3):
+                return None
+            vecs.append(tuple(float(x) for x in v))
+        if sum(abs(x) for v in vecs for x in v) < 1e-6:
+            return None
+        return tuple(vecs)
 
     def _parse_track_group(self, tg_type: Optional[Tuple[int, int]], tref: Tuple[int, int]) -> Gr2TrackGroup:
         tg_obj = self._read_struct(tg_type, tref)
@@ -788,6 +809,9 @@ class _Gr2Reader:
     def _parse_curve(self, curve_field: Any) -> Optional[Gr2Curve]:
         if curve_field is None:
             return None
+        # Legacy (Granny 2.4-era) inline curve: {Degree, Knots[], Controls[]} of Real32
+        if isinstance(curve_field, dict) and "Knots" in curve_field and "Controls" in curve_field:
+            return self._decode_legacy_curve(curve_field)
         # VariantReference (type_ref, obj_ref) or inline CurveData struct
         if isinstance(curve_field, tuple) and len(curve_field) == 2:
             ctype, cobj = curve_field
@@ -817,6 +841,21 @@ class _Gr2Reader:
             dim = int(cstruct.get("Dimension", dim or 4))
 
         return self._decode_curve(codec, fmt, degree, dim, cstruct)
+
+    def _decode_legacy_curve(self, cstruct: Dict[str, Any]) -> Optional[Gr2Curve]:
+        """Decode an old-style granny_curve. No knots means "not animated" (use the rest value)."""
+        knots = self._read_typed_array(cstruct.get("Knots"), "<f")
+        controls_flat = self._read_typed_array(cstruct.get("Controls"), "<f")
+        if not knots or not controls_flat:
+            return None
+        d = len(controls_flat) // len(knots)
+        if d <= 0:
+            return None
+        controls = tuple(tuple(controls_flat[i * d:(i + 1) * d]) for i in range(len(knots)))
+        degree = int(cstruct.get("Degree", 0))
+        if len(knots) == 1:
+            return Gr2Curve(codec="Legacy", fmt=0, degree=degree, dimension=d, constant_value=controls[0])
+        return Gr2Curve(codec="Legacy", fmt=0, degree=degree, dimension=d, knots=knots, controls=controls)
 
     def _decode_curve(
         self,

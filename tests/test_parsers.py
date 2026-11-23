@@ -63,6 +63,7 @@ from tests.test_fixtures import (
     build_mgf_v4,
     build_mgic_picture,
     build_synthetic_gr2,
+    build_synthetic_legacy_gr2,
     build_synthetic_workspace,
     build_vers_file,
     build_wdf,
@@ -332,6 +333,24 @@ class TestGranny2(unittest.TestCase):
             p1_end = evaluate_curve(tracks[1].position, 1.0, (0.0, 0.0, 0.0))
             self.assertAlmostEqual(p1_end[1], 1.5, places=3)
 
+
+    def test_legacy_inline_curves_and_art_tool_axes(self) -> None:
+        gr2 = parse_gr2(build_synthetic_legacy_gr2())
+        max_axes = ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0))
+        self.assertEqual(gr2.axes, max_axes)
+        self.assertEqual(gr2.skeletons[0].axes, max_axes)
+        self.assertEqual(gr2.animations[0].axes, max_axes)
+        self.assertAlmostEqual(gr2.skeletons[0].bones[0].local_transform.scale_shear[0], 1.25, places=5)
+
+        hip, leg = gr2.animations[0].track_groups[0].transform_tracks
+        self.assertEqual((hip.name, leg.name), ("joint_hip", "joint_leg"))
+        # Knot-less legacy curves mean "not animated"
+        self.assertIsNone(hip.position)
+        self.assertIsNone(leg.orientation)
+        self.assertIsNotNone(hip.orientation)
+        self.assertEqual((hip.orientation.degree, hip.orientation.dimension), (1, 4))
+        q_end = evaluate_curve(hip.orientation, 1.0, (0.0, 0.0, 0.0, 1.0))
+        np.testing.assert_allclose(q_end, (0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0)), atol=1e-6)
 
     def test_evaluate_curve_np_matches_scalar(self) -> None:
         rng = np.random.default_rng(1234)

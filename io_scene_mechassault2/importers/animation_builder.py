@@ -9,7 +9,13 @@ import numpy as np
 from mathutils import Matrix, Vector
 
 from ..formats.gr2 import Gr2Animation, Gr2Curve, Gr2Skeleton, Gr2Transform, evaluate_curve_np
-from .coord import gr2_trs_to_blender_matrix
+from .coord import gr2_basis_to_blender, gr2_trs_to_blender_matrix
+
+
+#: Bone ID property holding the bone's exact rest world matrix (Granny rest or model joint node) in
+#: Blender space (16 floats, row-major). Edit bones cannot hold scale/shear or an arbitrary axis, so
+#: actions use it to map Granny transforms onto the bone's actual rest frame.
+GR2_REST_PROP = "ma2_gr2_rest_world"
 
 
 def build_armature(
@@ -17,8 +23,14 @@ def build_armature(
     name: str = "",
     scale: float = 1.0,
     collection: Optional[bpy.types.Collection] = None,
+    rest_world: Optional[Dict[str, Matrix]] = None,
 ) -> Tuple[bpy.types.Object, List[Matrix]]:
     """Build a Blender Armature from a Gr2Skeleton.
+
+    `rest_world` optionally maps lower-cased bone names to armature-space rest matrices that override
+    the skeleton's own rest pose. Models pass their joint nodes here. Skeletons are often shared
+    between mechs, or lack the model's root offset and scale, so the model's joints are the true
+    pivots. Bones without an entry are placed by their Granny local transform under their parent.
 
     Returns (armature_obj, rest_local_matrices_bl).
     """
@@ -39,9 +51,9 @@ def build_armature(
 
     for i, b in enumerate(bones):
         lt = b.local_transform
-        lm = gr2_trs_to_blender_matrix(lt.position, lt.orientation, lt.scale_shear, world_scale=scale)
+        lm = gr2_trs_to_blender_matrix(lt.position, lt.orientation, lt.scale_shear, world_scale=scale, axes=skeleton.axes)
         local_mats.append(lm)
-        if 0 <= b.parent_index < n_bones:
+        if 0 <= b.parent_index < n_bones and b.parent_index != i:
             children_map[b.parent_index].append(i)
 
     # Compute world matrices in topological / parent-first order
@@ -50,16 +62,64 @@ def build_armature(
     def ensure_world(idx: int) -> Matrix:
         if computed[idx]:
             return world_mats[idx]
+        computed[idx] = True  # guards against malformed parent cycles
         p = bones[idx].parent_index
-        if 0 <= p < n_bones and p != idx:
+        override = rest_world.get(bones[idx].name.lower()) if rest_world else None
+        if override is not None:
+            world_mats[idx] = override.copy()
+        elif 0 <= p < n_bones and p != idx:
             world_mats[idx] = ensure_world(p) @ local_mats[idx]
         else:
             world_mats[idx] = local_mats[idx]
-        computed[idx] = True
         return world_mats[idx]
 
     for i in range(n_bones):
         ensure_world(i)
+
+    heads = [wm.translation.copy() for wm in world_mats]
+    if n_bones:
+        lo = Vector((min(h.x for h in heads), min(h.y for h in heads), min(h.z for h in heads)))
+        hi = Vector((max(h.x for h in heads), max(h.y for h in heads), max(h.z for h in heads)))
+        extent = (hi - lo).length
+    else:
+        extent = 0.0
+    default_len = max(0.04 * extent, 0.05 * scale, 1e-3)
+    min_len = 0.25 * default_len
+
+    def axis_of(wm: Matrix, col: int) -> Vector:
+        v = wm.to_3x3().col[col].copy()
+        return v.normalized() if v.length > 1e-9 else Vector((0.0, 0.0, 0.0))
+
+    # Bone directions: toward the farthest child joint when it is far enough away, else the parent's
+    # direction (so zero-offset helper joints line up with the chain), else the joint's own +Y axis.
+    directions: List[Optional[Vector]] = [None] * n_bones
+    lengths: List[float] = [default_len] * n_bones
+
+    def ensure_dir(i: int) -> Vector:
+        if directions[i] is not None:
+            return directions[i]
+        directions[i] = Vector((0.0, 0.0, 1.0))  # placeholder against cycles
+        best = None
+        for c in children_map[i]:
+            d = heads[c] - heads[i]
+            if d.length > min_len and (best is None or d.length > best.length):
+                best = d
+        if best is not None:
+            directions[i] = best.normalized()
+            lengths[i] = best.length
+        else:
+            p = bones[i].parent_index
+            y_axis = axis_of(world_mats[i], 1)
+            if 0 <= p < n_bones and p != i:
+                directions[i] = ensure_dir(p)
+            elif y_axis.length > 0.5:
+                directions[i] = y_axis
+            else:
+                directions[i] = Vector((0.0, 0.0, 1.0))
+        return directions[i]
+
+    for i in range(n_bones):
+        ensure_dir(i)
 
     # Enter Edit Mode on the armature to create bones
     prev_active = bpy.context.view_layer.objects.active
@@ -71,27 +131,14 @@ def build_armature(
         for i, b in enumerate(bones):
             eb = arm_data.edit_bones.new(b.name or f"Bone_{i}")
             bl_bone_names.append(eb.name)
-            wm = world_mats[i]
-            head = wm.translation
-            rot3 = wm.to_3x3()
-            # Orient +Y along bone axis so EditBone matrix aligns cleanly with wm
-            y_dir = rot3 @ Vector((0.0, 1.0, 0.0))
-            if y_dir.length < 1e-6:
-                y_dir = Vector((0.0, 1.0, 0.0))
-            else:
-                y_dir.normalize()
-
-            bone_len = 0.2 * scale
-            if children_map[i]:
-                c_pos = world_mats[children_map[i][0]].translation
-                dist = (c_pos - head).length
-                if dist > 0.02 * scale:
-                    bone_len = dist
-            eb.head = head
-            eb.tail = head + y_dir * bone_len
-            z_dir = rot3 @ Vector((0.0, 0.0, 1.0))
-            if z_dir.length > 1e-6:
-                eb.align_roll(z_dir)
+            eb.head = heads[i]
+            eb.tail = heads[i] + directions[i] * lengths[i]
+            # Roll: keep the joint's own Z (or X) axis as close as possible to the bone's Z
+            ref = axis_of(world_mats[i], 2)
+            if ref.length < 0.5 or abs(ref.dot(directions[i])) > 0.99:
+                ref = axis_of(world_mats[i], 0)
+            if ref.length > 0.5 and abs(ref.dot(directions[i])) < 0.99:
+                eb.align_roll(ref)
             ebones.append(eb)
 
         for i, b in enumerate(bones):
@@ -101,10 +148,11 @@ def build_armature(
         bpy.ops.object.mode_set(mode="OBJECT")
         bpy.context.view_layer.objects.active = prev_active
 
-    # Record exact rest local matrices from Blender's built bone hierarchy
+    # Remember each bone's exact Granny rest frame for build_action, and record rest locals
     actual_rest_local: List[Matrix] = []
     for i, b in enumerate(bones):
         bl_bone = arm_data.bones[bl_bone_names[i]]
+        bl_bone[GR2_REST_PROP] = [v for row in world_mats[i] for v in row]
         if 0 <= b.parent_index < n_bones and b.parent_index != i:
             parent_bl = arm_data.bones[bl_bone_names[b.parent_index]]
             actual_rest_local.append(parent_bl.matrix_local.inverted() @ bl_bone.matrix_local)
@@ -112,6 +160,14 @@ def build_armature(
             actual_rest_local.append(bl_bone.matrix_local.copy())
 
     return arm_obj, actual_rest_local
+
+
+def gr2_rest_world(bone: bpy.types.Bone) -> Matrix:
+    """The Granny rest world matrix stored on `bone` by build_armature (falls back to its Blender rest)."""
+    vals = bone.get(GR2_REST_PROP)
+    if vals is not None and len(vals) == 16:
+        return Matrix([list(vals[r * 4:(r + 1) * 4]) for r in range(4)])
+    return bone.matrix_local.copy()
 
 
 # --------------------------------------------------------------------------- #
@@ -187,21 +243,29 @@ def gr2_trs_to_blender_np(
     rot_xyzw: np.ndarray,
     scale_shear: np.ndarray,
     world_scale: float = 1.0,
+    axes: Optional[Sequence[Sequence[float]]] = None,
 ) -> np.ndarray:
     """Batched `coord.gr2_trs_to_blender_matrix`: (T, 3), (T, 4), (T, 9|3|1) -> (T, 4, 4) Blender matrices."""
     n = pos.shape[0]
-    # Quaternion (x, y, z, w) under the Y<->Z reflection -> Blender (w, -x, -z, -y)
-    q = np.stack((rot_xyzw[:, 3], -rot_xyzw[:, 0], -rot_xyzw[:, 2], -rot_xyzw[:, 1]), axis=1)
+    if axes:
+        q = np.stack((rot_xyzw[:, 3], rot_xyzw[:, 0], rot_xyzw[:, 1], rot_xyzw[:, 2]), axis=1)
+    else:
+        # Legacy: quaternion (x, y, z, w) under the Y<->Z reflection -> Blender (w, -x, -z, -y)
+        q = np.stack((rot_xyzw[:, 3], -rot_xyzw[:, 0], -rot_xyzw[:, 2], -rot_xyzw[:, 1]), axis=1)
     q_norm = np.linalg.norm(q, axis=1, keepdims=True)
     q = np.where(q_norm > 1e-12, q / np.where(q_norm > 1e-12, q_norm, 1.0), np.array([1.0, 0.0, 0.0, 0.0]))
 
-    s_ma2 = _scale_shear_to_mat3_np(scale_shear)
-    s_bl = s_ma2[:, _SWAP_YZ_PERM][:, :, _SWAP_YZ_PERM]  # C * S * C
-
+    s_src = _scale_shear_to_mat3_np(scale_shear)
     out = np.zeros((n, 4, 4), dtype=np.float64)
-    out[:, :3, :3] = _quat_wxyz_to_mat3_np(q) @ s_bl
-    out[:, :3, 3] = pos[:, _SWAP_YZ_PERM] * world_scale
     out[:, 3, 3] = 1.0
+    if axes:
+        k = gr2_basis_to_blender(axes)
+        out[:, :3, :3] = k @ (_quat_wxyz_to_mat3_np(q) @ s_src) @ k.T
+        out[:, :3, 3] = (pos @ k.T) * world_scale
+    else:
+        s_bl = s_src[:, _SWAP_YZ_PERM][:, :, _SWAP_YZ_PERM]  # C * S * C
+        out[:, :3, :3] = _quat_wxyz_to_mat3_np(q) @ s_bl
+        out[:, :3, 3] = pos[:, _SWAP_YZ_PERM] * world_scale
     return out
 
 
@@ -308,6 +372,9 @@ def build_action(
     arm_data = armature_obj.data
     bone_by_lower = {b.name.lower(): b for b in arm_data.bones}
 
+    # Granny file axes: prefer the animation's own ArtToolInfo, else the skeleton's
+    axes = anim.axes or (skeleton.axes if skeleton is not None else None)
+
     skel_rest_by_lower: Dict[str, Gr2Transform] = {}
     if skeleton is not None:
         for sb in skeleton.bones:
@@ -327,11 +394,13 @@ def build_action(
                 continue
             pose_bone.rotation_mode = "QUATERNION"
 
-            if bl_bone.parent is not None:
-                rest_local = bl_bone.parent.matrix_local.inverted() @ bl_bone.matrix_local
-            else:
-                rest_local = bl_bone.matrix_local
-            rest_inv = np.array(rest_local.inverted(), dtype=np.float64)
+            # Pose basis that makes the bone follow the Granny pose exactly (see build_armature):
+            #   basis = (B^-1 @ G_parent) @ L_anim @ (G^-1 @ B)
+            # B = Blender rest frame, G = Granny rest world frame, L_anim = animated Granny local.
+            g_rest = gr2_rest_world(bl_bone)
+            g_parent = gr2_rest_world(bl_bone.parent) if bl_bone.parent is not None else Matrix.Identity(4)
+            left = np.array(bl_bone.matrix_local.inverted() @ g_parent, dtype=np.float64)
+            right = np.array(g_rest.inverted() @ bl_bone.matrix_local, dtype=np.float64)
             s_rest = skel_rest_by_lower.get(track.name.lower(), Gr2Transform())
 
             times, interpolation = track_key_times(
@@ -341,7 +410,7 @@ def build_action(
             rot = evaluate_curve_np(track.orientation, times, s_rest.orientation)
             ss = evaluate_curve_np(track.scale_shear, times, s_rest.scale_shear)
 
-            basis = rest_inv @ gr2_trs_to_blender_np(pos, rot, ss, world_scale=scale)
+            basis = left @ gr2_trs_to_blender_np(pos, rot, ss, world_scale=scale, axes=axes) @ right
             locs, quats, scales = decompose_np(basis)
             quats = make_quats_continuous(quats)
 

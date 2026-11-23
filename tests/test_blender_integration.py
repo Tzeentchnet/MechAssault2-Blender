@@ -19,7 +19,7 @@ if str(_REPO_ROOT) not in sys.path:
 import io_scene_mechassault2
 from io_scene_mechassault2.formats.index_cache import index_file_for_source
 from io_scene_mechassault2.formats.mgf import MGFArchive
-from tests.test_fixtures import build_synthetic_workspace, write_synthetic_xiso
+from tests.test_fixtures import build_synthetic_legacy_gr2, build_synthetic_workspace, write_synthetic_xiso
 
 
 def reset_scene() -> None:
@@ -202,6 +202,48 @@ def test_animation_gr2(loose_gr2: Path) -> None:
     scene = bpy.context.scene
     assert scene.render.fps == 30 and scene.frame_start == 1 and scene.frame_end == 31
     print("[PASS] GR2 Skeleton & Slotted Action Animation Import")
+
+
+def test_max_space_rig_and_rigid_parts() -> None:
+    """3ds Max (Z-up) GR2 rigs land upright, and bone-parented rigid parts follow the pose exactly."""
+    import numpy as np
+    from mathutils import Vector
+    from io_scene_mechassault2.formats.gr2 import parse_gr2
+    from io_scene_mechassault2.importers.animation_builder import build_action, build_armature
+    from io_scene_mechassault2.importers.model_builder import _parent_to_bone
+
+    reset_scene()
+    gr2 = parse_gr2(build_synthetic_legacy_gr2())
+    skel = gr2.skeletons[0]
+    arm, _ = build_armature(skel, name="LegacyRig")
+    bones = arm.data.bones
+    # Max (gx, gy, gz) -> Blender (-gx, -gy, gz); the 1.25 root scale carries into child offsets
+    assert (bones["joint_hip"].head_local - Vector((0.0, 0.0, 5.0))).length < 1e-4, bones["joint_hip"].head_local
+    assert (bones["joint_leg"].head_local - Vector((-1.25, 0.0, 2.5))).length < 1e-4, bones["joint_leg"].head_local
+
+    # A rigid part on joint_leg, offset from the joint and rotated, as MA2 mesh nodes are
+    part = bpy.data.objects.new("leg_part", None)
+    bpy.context.scene.collection.objects.link(part)
+    part_rest = Matrix.Translation((-1.25, 0.5, 2.0)) @ Matrix.Rotation(0.3, 4, "X")
+    _parent_to_bone(part, arm, "joint_leg", part_rest)
+
+    act = build_action(arm, gr2.animations[0], skeleton=skel, fps=30.0)
+    scene = bpy.context.scene
+    scene.frame_set(1)
+    bpy.context.view_layer.update()
+    for pb in arm.pose.bones:  # rest-valued keys must reproduce the rest pose exactly
+        assert np.allclose(np.array(pb.matrix), np.array(pb.bone.matrix_local), atol=1e-4), pb.name
+    assert np.allclose(np.array(part.matrix_world), np.array(part_rest), atol=1e-4)
+
+    # Granny's 90 degrees about Max +Z is 90 degrees about Blender +Z: the leg swings from -X to -Y
+    scene.frame_set(31)
+    bpy.context.view_layer.update()
+    leg_head = arm.pose.bones["joint_leg"].head
+    assert (leg_head - Vector((0.0, -1.25, 2.5))).length < 1e-3, leg_head
+    swing = Matrix.Translation((0.0, 0.0, 5.0)) @ Matrix.Rotation(math.pi / 2.0, 4, "Z") @ Matrix.Translation((0.0, 0.0, -5.0))
+    assert np.allclose(np.array(part.matrix_world), np.array(swing @ part_rest), atol=1e-3), part.matrix_world
+    assert act.frame_end == 31.0
+    print("[PASS] 3ds Max-space GR2 rig, legacy curves & bone-parented rigid parts")
 
 
 def test_vectorized_transforms_match_mathutils() -> None:
@@ -426,6 +468,7 @@ def main() -> None:
         test_model_legacy_node(loose)
         test_vectorized_transforms_match_mathutils()
         test_animation_gr2(ws["loose_gr2"])
+        test_max_space_rig_and_rigid_parts()
         test_map_import(loose)
         test_texture_import(ws["loose_tex"])
         test_sidebar_browser(ws_dir)

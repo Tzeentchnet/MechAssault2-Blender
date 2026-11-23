@@ -145,6 +145,23 @@ def _assign_skin_weights(
                 vgroups[inds[slot]].add((vi,), w, "REPLACE")
 
 
+def _parent_to_bone(
+    obj: bpy.types.Object,
+    arm_obj: bpy.types.Object,
+    bone_name: str,
+    rest_matrix: Matrix,
+) -> None:
+    """Bone-parent `obj` so it sits at `rest_matrix` (armature space) in rest pose and rigidly follows the bone."""
+    bone = arm_obj.data.bones[bone_name]
+    # Blender's bone-parent matrix is the bone's frame moved to its tail
+    parent_rest = bone.matrix_local @ Matrix.Translation((0.0, bone.length, 0.0))
+    obj.parent = arm_obj
+    obj.parent_type = "BONE"
+    obj.parent_bone = bone_name
+    obj.matrix_parent_inverse = parent_rest.inverted()
+    obj.matrix_basis = rest_matrix
+
+
 def build_model_in_blender(
     model: ModelDef,
     source: AssetSource,
@@ -168,14 +185,26 @@ def build_model_in_blender(
             gr2_skel = parse_gr2(source.read(model.skeleton))
             if gr2_skel.skeletons:
                 skeleton = gr2_skel.skeletons[0]
+                # The model's joint nodes are the real pivots; the .gr2 rest pose may be shared or offset
+                node_rest: Dict[str, Matrix] = {}
+                for nd in model.nodes:
+                    if nd.name:
+                        node_rest.setdefault(nd.name.lower(), mat4_row_to_blender(nd.world, scale=settings.scale))
                 arm_obj, _rest = build_armature(
                     skeleton,
                     name=f"{root_name}_Armature",
                     scale=settings.scale,
                     collection=target_col,
+                    rest_world=node_rest,
                 )
         except Exception as exc:
             model.warnings.append(f"Skeleton {model.skeleton} load failed: {exc}")
+
+    # Rigid MA2 models drive their node hierarchy from the skeleton: nodes named like a bone
+    # (e.g. "joint_luarm" <-> "joint_luarm") follow that bone, along with everything beneath them.
+    bone_for_node: Dict[str, str] = {}
+    if arm_obj is not None:
+        bone_for_node = {b.name.lower(): b.name for b in arm_obj.data.bones}
 
     if arm_obj is not None:
         root_obj = arm_obj
@@ -220,6 +249,11 @@ def build_model_in_blender(
     # Build node hierarchy
     node_objs: List[Optional[bpy.types.Object]] = [None] * len(model.nodes)
 
+    def _attach_bone(obj: bpy.types.Object, nd) -> None:
+        bone_name = bone_for_node.get((nd.name or "").lower())
+        if bone_name is not None:
+            _parent_to_bone(obj, arm_obj, bone_name, mat4_row_to_blender(nd.world, scale=settings.scale))
+
     for ni, nd in enumerate(model.nodes):
         if not settings.include_invisible and (not nd.turned_on or nd.hidden_by_mtb or (nd.lod > 0 and not settings.all_lods)):
             # Still create parent Empty if needed by visible descendants, else skip
@@ -248,6 +282,7 @@ def build_model_in_blender(
             lobj.matrix_local = local_mat
             target_col.objects.link(lobj)
             node_objs[ni] = lobj
+            _attach_bone(lobj, nd)
             continue
 
         node_meshes = meshes_by_node.get(ni, [])
@@ -275,6 +310,7 @@ def build_model_in_blender(
             else:
                 mobj.parent = parent_obj
                 mobj.matrix_local = local_mat
+                _attach_bone(mobj, nd)
             if not sm.visible:
                 mobj.hide_set(True)
                 mobj.hide_render = True
@@ -288,6 +324,7 @@ def build_model_in_blender(
             eobj.matrix_local = local_mat
             target_col.objects.link(eobj)
             node_objs[ni] = eobj
+            _attach_bone(eobj, nd)
 
             for sm_idx, sm in node_meshes:
                 if hide_additive and 0 <= sm.material_index < len(model.materials):
@@ -326,21 +363,38 @@ def build_model_in_blender(
 
     # Import associated animations onto Armature
     if settings.import_animations and arm_obj is not None and model.anim_clips:
+        # Leave the primary clip (else the first one) active, rather than whichever loaded last
+        preferred = next((c for c in model.anim_clips if c.primary), model.anim_clips[0])
+        active: Optional[bpy.types.Action] = None
         for clip in model.anim_clips:
             if not source.exists(clip.path):
                 continue
             try:
                 gr2_anim = parse_gr2(source.read(clip.path))
                 for anim in gr2_anim.animations:
-                    build_action(
+                    action = build_action(
                         arm_obj,
                         anim,
                         skeleton=skeleton,
                         fps=settings.fps,
                         scale=settings.scale,
                         action_name=clip.name or anim.name,
+                        set_scene_range=False,
                     )
+                    if active is None or clip is preferred:
+                        active = action
             except Exception as exc:
                 model.warnings.append(f"Animation {clip.path} load failed: {exc}")
+        if active is not None:
+            arm_obj.animation_data.action = active
+            if active.slots:
+                arm_obj.animation_data.action_slot = active.slots[0]
+            scene = bpy.context.scene
+            if settings.fps > 0.0:
+                fps_int = max(1, int(round(settings.fps)))
+                scene.render.fps = fps_int
+                scene.render.fps_base = fps_int / settings.fps
+            scene.frame_start = int(active.frame_start)
+            scene.frame_end = max(scene.frame_start, int(math.ceil(active.frame_end - 1e-6)))
 
     return root_obj

@@ -527,6 +527,118 @@ def _pack_d4n8(qx: float, qy: float, qz: float, qw: float) -> Tuple[int, int, in
     return c0, c1, c2
 
 
+#: Rest pose of the legacy fixture skeleton, in 3ds Max space (Z-up), like the shipped mech rigs:
+#: (name, parent, position, uniform scale)
+LEGACY_GR2_BONES = (
+    ("joint_WORLD", -1, (0.0, 0.0, 0.0), 1.25),
+    ("joint_hip", 0, (0.0, 0.0, 4.0), 1.0),
+    ("joint_leg", 1, (1.0, 0.0, -2.0), 1.0),
+)
+
+
+def build_synthetic_legacy_gr2() -> bytes:
+    """Build a GR2 shaped like MA2's 3ds Max exports.
+
+    It has a MAX ArtToolInfo (right +X, up +Z, back -Y), a uniformly scaled root bone, and legacy inline
+    `{Degree, Knots[], Controls[]}` curves. Clip "Swing" turns joint_hip 90 degrees about Max +Z over
+    1 s (degree 1). joint_leg's curves have no knots, so it stays at its rest pose.
+    """
+    b = Gr2Builder()
+    t_f32 = b.add_type_def([(10, "Real32", None, 0)])
+    t_ati = b.add_type_def([
+        (8, "FromArtToolName", None, 0),
+        (10, "UnitsPerMeter", None, 0),
+        (10, "Origin", None, 3),
+        (10, "RightVector", None, 3),
+        (10, "UpVector", None, 3),
+        (10, "BackVector", None, 3),
+    ])
+    t_bone = b.add_type_def([
+        (8, "Name", None, 0),
+        (19, "ParentIndex", None, 0),
+        (9, "Transform", None, 0),
+    ])
+    t_skel = b.add_type_def([(8, "Name", None, 0), (3, "Bones", t_bone, 0)])
+    # Legacy granny_curve: Degree(4) + Knots ref-array(8) + Controls ref-array(8) = 20 bytes
+    t_curve = b.add_type_def([(19, "Degree", None, 0), (3, "Knots", t_f32, 0), (3, "Controls", t_f32, 0)])
+    t_track = b.add_type_def([
+        (8, "Name", None, 0),
+        (1, "PositionCurve", t_curve, 0),
+        (1, "OrientationCurve", t_curve, 0),
+        (1, "ScaleShearCurve", t_curve, 0),
+    ])
+    t_tg = b.add_type_def([(8, "Name", None, 0), (3, "TransformTracks", t_track, 0)])
+    t_anim = b.add_type_def([
+        (8, "Name", None, 0),
+        (10, "Duration", None, 0),
+        (10, "TimeStep", None, 0),
+        (4, "TrackGroups", t_tg, 0),
+    ])
+    t_root = b.add_type_def([
+        (2, "ArtToolInfo", t_ati, 0),
+        (4, "Skeletons", t_skel, 0),
+        (4, "Animations", t_anim, 0),
+    ])
+
+    # ArtToolInfo: 4 + 4 + 4 * 12 = 56 bytes
+    ati_off = b.add_bytes(b"\x00" * 56, align=4)
+    b.add_reloc(ati_off, b.add_string("3D Studio MAX"))
+    struct.pack_into("<f12f", b.sec, ati_off + 4, 1.0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -1, 0)
+
+    # Skeleton bones: Name(4) + ParentIndex(4) + Transform(68) = 76 bytes
+    bones_off = b.add_bytes(b"\x00" * (76 * len(LEGACY_GR2_BONES)), align=4)
+    for bi, (name, parent, pos, scl) in enumerate(LEGACY_GR2_BONES):
+        boff = bones_off + bi * 76
+        b.add_reloc(boff, b.add_string(name))
+        struct.pack_into("<i", b.sec, boff + 4, parent)
+        struct.pack_into("<I3f4f9f", b.sec, boff + 8, 7, *pos, 0.0, 0.0, 0.0, 1.0,
+                         scl, 0.0, 0.0, 0.0, scl, 0.0, 0.0, 0.0, scl)
+    skel_off = b.add_bytes(b"\x00" * 12, align=4)
+    b.add_reloc(skel_off, b.add_string("LegacySkeleton"))
+    struct.pack_into("<I", b.sec, skel_off + 4, len(LEGACY_GR2_BONES))
+    b.add_reloc(skel_off + 8, bones_off)
+    skel_ptrs = b.add_bytes(b"\x00" * 4, align=4)
+    b.add_reloc(skel_ptrs, skel_off)
+
+    def write_curve(off: int, degree: int, knots: Sequence[float], controls: Sequence[float]) -> None:
+        struct.pack_into("<i", b.sec, off, degree)
+        if knots:
+            struct.pack_into("<I", b.sec, off + 4, len(knots))
+            b.add_reloc(off + 8, b.add_bytes(struct.pack(f"<{len(knots)}f", *knots), align=4))
+            struct.pack_into("<I", b.sec, off + 12, len(controls))
+            b.add_reloc(off + 16, b.add_bytes(struct.pack(f"<{len(controls)}f", *controls), align=4))
+
+    # Tracks: Name(4) + 3 inline curves(20 each) = 64 bytes
+    s45 = math.sin(math.pi / 4.0)
+    tracks_off = b.add_bytes(b"\x00" * (64 * 2), align=4)
+    b.add_reloc(tracks_off, b.add_string("joint_hip"))
+    write_curve(tracks_off + 24, 1, (0.0, 1.0), (0.0, 0.0, 0.0, 1.0, 0.0, 0.0, s45, s45))
+    b.add_reloc(tracks_off + 64, b.add_string("joint_leg"))
+
+    tg_off = b.add_bytes(b"\x00" * 12, align=4)
+    b.add_reloc(tg_off, b.add_string("joint_WORLD"))
+    struct.pack_into("<I", b.sec, tg_off + 4, 2)
+    b.add_reloc(tg_off + 8, tracks_off)
+    tg_ptrs = b.add_bytes(b"\x00" * 4, align=4)
+    b.add_reloc(tg_ptrs, tg_off)
+
+    anim_off = b.add_bytes(b"\x00" * 20, align=4)
+    b.add_reloc(anim_off, b.add_string("Swing"))
+    struct.pack_into("<2fI", b.sec, anim_off + 4, 1.0, 1.0 / 30.0, 1)
+    b.add_reloc(anim_off + 16, tg_ptrs)
+    anim_ptrs = b.add_bytes(b"\x00" * 4, align=4)
+    b.add_reloc(anim_ptrs, anim_off)
+
+    # Root: ArtToolInfo ref(4) + Skeletons(8) + Animations(8) = 20 bytes
+    root_off = b.add_bytes(b"\x00" * 20, align=4)
+    b.add_reloc(root_off, ati_off)
+    struct.pack_into("<I", b.sec, root_off + 4, 1)
+    b.add_reloc(root_off + 8, skel_ptrs)
+    struct.pack_into("<I", b.sec, root_off + 12, 1)
+    b.add_reloc(root_off + 16, anim_ptrs)
+    return b.finalize(t_root, root_off)
+
+
 def build_synthetic_gr2(
     bone_names: Sequence[str] = ("Pelvis", "Spine"),
     include_animation: bool = True,
