@@ -24,6 +24,7 @@ if bpy is not None:
         MA2_OT_scan_archives,
         restore_browser_from_cache,
     )
+    from .importers import range_sync
     from .preferences import MA2AddonPreferences
     from .ui import MA2BrowserItem, MA2BrowserSettings, MA2_PT_browser_panel, MA2_UL_asset_list
 
@@ -87,6 +88,7 @@ def register() -> None:
     bpy.types.TOPBAR_MT_file_import.append(_menu_func_import_tex)
     if _on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load_post)
+    range_sync.register()
     try:
         restore_browser_from_cache()
     except Exception:
@@ -108,6 +110,7 @@ def unregister() -> None:
         pass
     if _on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load_post)
+    range_sync.unregister()
     bpy.types.TOPBAR_MT_file_import.remove(_menu_func_import_tex)
     bpy.types.TOPBAR_MT_file_import.remove(_menu_func_import_map)
     bpy.types.TOPBAR_MT_file_import.remove(_menu_func_import_anim)

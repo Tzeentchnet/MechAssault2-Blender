@@ -27,11 +27,21 @@ class MA2AddonPreferences(bpy.types.AddonPreferences):
         default=True,
     )
 
+    sync_scene_range: BoolProperty(
+        name="Sync Scene Range to Clip",
+        description=(
+            "When another clip (action) is made active on an imported MechAssault 2 rig, set the scene "
+            "frame range to that clip's length"
+        ),
+        default=True,
+    )
+
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
         layout.prop(self, "game_files_dir")
         layout.prop(self, "default_scale")
         layout.prop(self, "pack_textures")
+        layout.prop(self, "sync_scene_range")
 
 
 def get_preferences(context: bpy.types.Context | None = None) -> MA2AddonPreferences | None:

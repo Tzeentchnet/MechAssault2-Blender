@@ -263,7 +263,25 @@ def test_max_space_rig_and_rigid_parts() -> None:
     scene.frame_set(16)
     bpy.context.view_layer.update()
     assert np.allclose(poses[46], np.array(part.matrix_world), atol=1e-4), "Cycles modifier must wrap past the range"
-    print("[PASS] 3ds Max-space GR2 rig, legacy curves, rigid parts & seamless loops")
+
+    # Bones start selected, so the Action Editor's default "Only Show Selected" filter shows the keys
+    assert all(pb.select for pb in arm.pose.bones), "imported rig bones should be selected"
+
+    # Switching clips moves the scene range to the new clip (via the depsgraph handler)
+    scene.frame_start, scene.frame_end = 1, 10
+    arm.animation_data.action = act
+    arm.animation_data.action_slot = act.slots[0]
+    bpy.context.view_layer.update()  # first sight of the rig/action: range untouched
+    assert (scene.frame_start, scene.frame_end) == (1, 10), (scene.frame_start, scene.frame_end)
+    arm.animation_data.action = loop_act
+    arm.animation_data.action_slot = loop_act.slots[0]
+    bpy.context.view_layer.update()
+    assert (scene.frame_start, scene.frame_end) == (1, 30), (scene.frame_start, scene.frame_end)
+    arm.animation_data.action = act
+    arm.animation_data.action_slot = act.slots[0]
+    bpy.context.view_layer.update()
+    assert (scene.frame_start, scene.frame_end) == (1, 31), (scene.frame_start, scene.frame_end)
+    print("[PASS] 3ds Max-space GR2 rig, legacy curves, rigid parts, seamless loops & clip range sync")
 
 
 def test_vectorized_transforms_match_mathutils() -> None:

@@ -17,6 +17,9 @@ from .coord import gr2_basis_to_blender, gr2_trs_to_blender_matrix
 #: actions use it to map Granny transforms onto the bone's actual rest frame.
 GR2_REST_PROP = "ma2_gr2_rest_world"
 
+#: Object ID property marking armatures built by this importer
+MA2_RIG_PROP = "ma2_rig"
+
 
 def build_armature(
     skeleton: Gr2Skeleton,
@@ -147,6 +150,13 @@ def build_armature(
     finally:
         bpy.ops.object.mode_set(mode="OBJECT")
         bpy.context.view_layer.objects.active = prev_active
+
+    # Tag the rig (scene-range sync, see range_sync.py) and select its bones: the Dope Sheet / Action
+    # Editor's default "Only Show Selected" filter hides channels of unselected bones, so an
+    # unselected rig looks like it has no keyframes
+    arm_obj[MA2_RIG_PROP] = True
+    for pb in arm_obj.pose.bones:
+        pb.select = True
 
     # Remember each bone's exact Granny rest frame for build_action, and record rest locals
     actual_rest_local: List[Matrix] = []
