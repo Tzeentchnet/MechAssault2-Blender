@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "mechassault2_importer"
-version = "1.0.0"
+version = "1.1.0"
 name = "MechAssault 2 Importer"
 tagline = "Import MechAssault 2 models, materials, animations, and maps"
 maintainer = "MechAssault2-Blender Contributors"
