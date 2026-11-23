@@ -1,7 +1,7 @@
 """Blender 5.2 Model builder: node hierarchy, fast NumPy meshes, skinning, lights, and animations."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -9,7 +9,7 @@ import bpy
 import numpy as np
 from mathutils import Matrix
 
-from ..formats.gr2 import Gr2Skeleton, parse_gr2
+from ..formats.gr2 import Gr2Bone, Gr2Skeleton, Gr2Transform, parse_gr2
 from ..formats.mgf import AssetSource
 from ..formats.model import ModelDef, SubMeshDef
 from ..formats.text_utils import file_stem, normalize_path
@@ -118,6 +118,7 @@ def _assign_skin_weights(
     mesh_obj: bpy.types.Object,
     sm: SubMeshDef,
     skeleton: Gr2Skeleton,
+    arm_obj: Optional[bpy.types.Object] = None,
 ) -> None:
     if sm.bone_indices is None or sm.bone_weights is None:
         return
@@ -127,12 +128,22 @@ def _assign_skin_weights(
     if len(sm.bone_indices) != vcount:
         return
 
+    # Vertex groups bind to bones by exact name, but the mesh's skin list and the .gr2 differ in case
+    # ("bone_clavicle_r" vs "BONE_clavicle_R"), so name each group after the armature's own bone
+    arm_names: Dict[str, str] = {}
+    if arm_obj is not None:
+        arm_names = {b.name.lower(): b.name for b in arm_obj.data.bones}
+
     # Create vertex groups only for referenced bone indices
     used_indices = np.unique(sm.bone_indices)
     vgroups: Dict[int, bpy.types.VertexGroup] = {}
+    by_name: Dict[str, bpy.types.VertexGroup] = {}
     for bi in used_indices.tolist():
         gname = bone_map[bi] if 0 <= bi < len(bone_map) else f"Bone_{bi}"
-        vgroups[bi] = mesh_obj.vertex_groups.new(name=gname)
+        gname = arm_names.get(gname.lower(), gname)
+        if gname not in by_name:
+            by_name[gname] = mesh_obj.vertex_groups.new(name=gname)
+        vgroups[bi] = by_name[gname]
 
     bidx_list = sm.bone_indices.tolist()
     bwt_list = sm.bone_weights.tolist()
@@ -142,7 +153,55 @@ def _assign_skin_weights(
         for slot in range(4):
             w = wts[slot]
             if w > 1e-5:
-                vgroups[inds[slot]].add((vi,), w, "REPLACE")
+                vgroups[inds[slot]].add((vi,), w, "ADD")
+
+
+def _skeleton_with_model_joints(skeleton: Gr2Skeleton, model: ModelDef) -> Gr2Skeleton:
+    """`skeleton` plus the skinned model's joints that the .gr2 lacks, as extra bones.
+
+    Characters share small game skeletons (e.g. Natalia's 23-bone N_G_Skeleton) while their meshes are
+    skinned to the full cinematic joint set (fingers, face bones). Without these bones the vertices
+    weighted to them stay behind, and cinematic clips have nothing to drive. Extra bones are the skin
+    joints, plus mesh-less joint chains hanging off a bone (e.g. bone_hair01..03, animated only by
+    cinematic skeletons). Each hangs off its nearest ancestor bone; its rest pose is the joint node's.
+    Rigid models (no skinned meshes) are left alone, so their hardpoint Empties stay Empties.
+    """
+    skin_names = {n.lower() for sm in model.meshes if sm.skinned for n in sm.bone_names}
+    if not skin_names:
+        return skeleton
+    nodes = model.nodes
+    index_by_lower = {b.name.lower(): i for i, b in enumerate(skeleton.bones)}
+
+    # A node holds content if it or a descendant has a mesh or light (nodes are listed parent-first)
+    has_content = [nd.is_light for nd in nodes]
+    for sm in model.meshes:
+        if 0 <= sm.node_index < len(nodes):
+            has_content[sm.node_index] = True
+    for ni in range(len(nodes) - 1, -1, -1):
+        p = nodes[ni].parent
+        if has_content[ni] and 0 <= p < ni:
+            has_content[p] = True
+
+    extra: List[Gr2Bone] = []
+    for ni, nd in enumerate(nodes):
+        low = (nd.name or "").lower()
+        if not low or low in index_by_lower or has_content[ni]:
+            continue
+        p = nd.parent
+        parent_is_bone = 0 <= p < len(nodes) and (nodes[p].name or "").lower() in index_by_lower
+        if low not in skin_names and not parent_is_bone:
+            continue
+        parent_idx = -1
+        while 0 <= p < len(nodes):
+            parent_idx = index_by_lower.get((nodes[p].name or "").lower(), -1)
+            if parent_idx >= 0:
+                break
+            p = nodes[p].parent
+        index_by_lower[low] = len(skeleton.bones) + len(extra)
+        extra.append(Gr2Bone(index=index_by_lower[low], name=nd.name, parent_index=parent_idx, local_transform=Gr2Transform()))
+    if not extra:
+        return skeleton
+    return replace(skeleton, bones=list(skeleton.bones) + extra)
 
 
 def _parent_to_bone(
@@ -185,13 +244,14 @@ def build_model_in_blender(
             gr2_skel = parse_gr2(source.read(model.skeleton))
             if gr2_skel.skeletons:
                 skeleton = gr2_skel.skeletons[0]
+                rig = _skeleton_with_model_joints(skeleton, model)
                 # The model's joint nodes are the real pivots; the .gr2 rest pose may be shared or offset
                 node_rest: Dict[str, Matrix] = {}
                 for nd in model.nodes:
                     if nd.name:
                         node_rest.setdefault(nd.name.lower(), mat4_row_to_blender(nd.world, scale=settings.scale))
                 arm_obj, _rest = build_armature(
-                    skeleton,
+                    rig,
                     name=f"{root_name}_Armature",
                     scale=settings.scale,
                     collection=target_col,
@@ -254,7 +314,17 @@ def build_model_in_blender(
         if bone_name is not None:
             _parent_to_bone(obj, arm_obj, bone_name, mat4_row_to_blender(nd.world, scale=settings.scale))
 
+    # Joint nodes whose subtree holds no mesh or light are fully represented by their armature bone;
+    # an Empty for each would only duplicate the skeleton (nodes are listed parent-first)
+    has_content = [ni in meshes_by_node or nd.is_light for ni, nd in enumerate(model.nodes)]
+    for ni in range(len(model.nodes) - 1, -1, -1):
+        p = model.nodes[ni].parent
+        if has_content[ni] and 0 <= p < ni:
+            has_content[p] = True
+
     for ni, nd in enumerate(model.nodes):
+        if not has_content[ni] and (nd.name or "").lower() in bone_for_node:
+            continue
         if not settings.include_invisible and (not nd.turned_on or nd.hidden_by_mtb or (nd.lod > 0 and not settings.all_lods)):
             # Still create parent Empty if needed by visible descendants, else skip
             has_mesh = ni in meshes_by_node
@@ -304,7 +374,7 @@ def build_model_in_blender(
             if sm.skinned and arm_obj is not None and skeleton is not None:
                 mobj.parent = arm_obj
                 mobj.matrix_local = mat4_row_to_blender(nd.world, scale=settings.scale)
-                _assign_skin_weights(mobj, sm, skeleton)
+                _assign_skin_weights(mobj, sm, skeleton, arm_obj)
                 mod = mobj.modifiers.new(name="Armature", type="ARMATURE")
                 mod.object = arm_obj
             else:
@@ -343,7 +413,7 @@ def build_model_in_blender(
                 if sm.skinned and arm_obj is not None and skeleton is not None:
                     mobj.parent = arm_obj
                     mobj.matrix_local = mat4_row_to_blender(nd.world, scale=settings.scale)
-                    _assign_skin_weights(mobj, sm, skeleton)
+                    _assign_skin_weights(mobj, sm, skeleton, arm_obj)
                     mod = mobj.modifiers.new(name="Armature", type="ARMATURE")
                     mod.object = arm_obj
                 else:

@@ -480,6 +480,68 @@ print("CHILD_RESTART_OK")
     print("[PASS] XISO Scan, Streamed Import, Blender Reset & Restart Cache Persistence")
 
 
+def test_character_skin_binding() -> None:
+    """Character skins bind despite skin/.gr2 name case, and skin joints missing from the shared
+    game skeleton (fingers, face bones) become bones instead of loose Empties."""
+    import numpy as np
+    from io_scene_mechassault2.formats.model import ModelDef, NodeDef, SubMeshDef
+    from io_scene_mechassault2.importers.model_builder import ModelImportSettings, build_model_in_blender
+    from tests.test_fixtures import build_synthetic_gr2
+
+    class _Source:
+        files = {"skel.gr2": build_synthetic_gr2(("BONE_Pelvis", "BONE_Spine"), include_animation=False)}
+
+        def exists(self, path: str) -> bool:
+            return path in self.files
+
+        def read(self, path: str) -> bytes:
+            return self.files[path]
+
+    def at(x: float, y: float, z: float) -> tuple:
+        return (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, z, 1.0)
+
+    reset_scene()
+    skin = ["bone_pelvis", "bone_spine", "facebone_pupil", "char_body"]
+    nodes = [
+        NodeDef("char", "node_anim", -1, at(0, 0, 0), at(0, 0, 0)),
+        NodeDef("bone_pelvis", "node_generic", 0, at(0, 1, 0), at(0, 1, 0), turned_on=False),
+        NodeDef("bone_spine", "node_generic", 1, at(0, 0.5, 0), at(0, 1.5, 0), turned_on=False),
+        NodeDef("facebone_pupil", "node_generic", 2, at(0, 0.2, 0.1), at(0, 1.7, 0.1)),
+        NodeDef("bone_hair01", "node_generic", 2, at(0, 0.3, -0.1), at(0, 1.8, -0.1), turned_on=False),
+        NodeDef("bone_hair02", "node_generic", 4, at(0, 0.1, -0.1), at(0, 1.9, -0.2), turned_on=False),
+        NodeDef("char_body", "node_skinned", 0, at(0, 0, 0), at(0, 0, 0), bone_names=skin),
+    ]
+    mesh = SubMeshDef(
+        name="char_body mesh", node_name="char_body", node_index=6, material_index=-1, transform=at(0, 0, 0),
+        positions=np.array([(0, 1, 0), (0.2, 1.5, 0), (0, 1.7, 0.1)], dtype=np.float32),
+        normals=None, uv0=None, uv1=None, colors=None,
+        bone_indices=np.array([(0, 0, 0, 0), (1, 0, 0, 0), (2, 0, 0, 0)], dtype=np.uint8),
+        bone_weights=np.array([(1, 0, 0, 0)] * 3, dtype=np.float32),
+        triangles=np.array([(0, 1, 2)], dtype=np.uint32), skinned=True, bone_names=skin,
+    )
+    model = ModelDef(path="Models/Char.MGMODEL", skeleton="skel.gr2", nodes=nodes, meshes=[mesh])
+    arm = build_model_in_blender(model, _Source(), None, ModelImportSettings(import_materials=False))
+
+    bones = arm.data.bones
+    assert arm.type == "ARMATURE", model.warnings
+    assert {"facebone_pupil", "bone_hair01", "bone_hair02"} <= set(bones.keys()), list(bones.keys())
+    assert bones["facebone_pupil"].parent.name == "BONE_Spine" and bones["bone_hair02"].parent.name == "bone_hair01"
+    empties = sorted(o.name for o in bpy.data.objects if o.type == "EMPTY")
+    assert empties == ["char"], f"Joint nodes should be bones, not Empties: {empties}"
+
+    body = next(o for o in bpy.data.objects if o.type == "MESH")
+    assert sorted(g.name for g in body.vertex_groups) == ["BONE_Pelvis", "BONE_Spine", "facebone_pupil"]
+
+    # Raising the spine carries the spine and pupil vertices with it, and leaves the pelvis vertex
+    arm.pose.bones["BONE_Spine"].location = (0.0, 0.0, 0.0)
+    arm.pose.bones["BONE_Spine"].matrix = Matrix.Translation((0.0, 0.0, 0.5)) @ arm.pose.bones["BONE_Spine"].matrix
+    bpy.context.view_layer.update()
+    deformed = body.evaluated_get(bpy.context.evaluated_depsgraph_get()).to_mesh()
+    moved = [(deformed.vertices[i].co - body.data.vertices[i].co).length for i in range(3)]
+    assert moved[0] < 1e-5 and abs(moved[1] - 0.5) < 1e-4 and abs(moved[2] - 0.5) < 1e-4, moved
+    print("[PASS] Character Skin Binding & Model-Only Joints")
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as td:
         base = Path(td)
@@ -507,6 +569,7 @@ def main() -> None:
         test_vectorized_transforms_match_mathutils()
         test_animation_gr2(ws["loose_gr2"])
         test_max_space_rig_and_rigid_parts()
+        test_character_skin_binding()
         test_map_import(loose)
         test_texture_import(ws["loose_tex"])
         test_sidebar_browser(ws_dir)
