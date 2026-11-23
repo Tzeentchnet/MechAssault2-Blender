@@ -8,7 +8,7 @@ import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 
-from ..formats.gr2 import Gr2Animation, Gr2Curve, Gr2Skeleton, Gr2Transform, evaluate_curve_np
+from ..formats.gr2 import Gr2Animation, Gr2Curve, Gr2Skeleton, Gr2Transform, evaluate_curve_np, loop_curve
 from .coord import gr2_basis_to_blender, gr2_trs_to_blender_matrix
 
 
@@ -332,6 +332,7 @@ def _write_fcurve(
     frames: np.ndarray,
     values: np.ndarray,
     interpolation: int,
+    cyclic: bool = False,
 ) -> None:
     fc = action.fcurve_ensure_for_datablock(armature_obj, data_path, index=index, group_name=group_name)
     count = frames.size
@@ -341,7 +342,43 @@ def _write_fcurve(
     fc.keyframe_points.add(count)
     fc.keyframe_points.foreach_set("co", co.ravel())
     fc.keyframe_points.foreach_set("interpolation", np.full(count, interpolation, dtype=np.int32))
+    if cyclic and count > 1:
+        fc.modifiers.new(type="CYCLES")
     fc.update()
+
+
+def clip_is_closed(anim: Gr2Animation, tolerance: float = 0.1) -> bool:
+    """True if every animated curve of `anim` ends (nearly) where it starts, as authored loops do.
+
+    Compares raw curve values (quaternion components, local positions) at t = 0 and t = duration.
+    """
+    duration = anim.duration
+    if duration <= 0.0:
+        return False
+    ends = np.array([0.0, duration])
+    for tg in anim.track_groups:
+        for track in tg.transform_tracks:
+            for curve in (track.position, track.orientation, track.scale_shear):
+                if curve is None or curve.constant_value or len(curve.knots) < 2:
+                    continue
+                v = evaluate_curve_np(curve, ends, (0.0,) * max(1, curve.dimension))
+                gap = v[1] - v[0]
+                if curve.dimension == 4 and np.dot(v[0], v[1]) < 0.0:
+                    gap = v[1] + v[0]  # q and -q are the same rotation
+                if np.abs(gap).max() > tolerance:
+                    return False
+    return True
+
+
+def playback_end_frame(action: bpy.types.Action) -> int:
+    """Last scene frame for playing `action` once. A cyclic clip's final frame duplicates its first, so
+    it is left out to keep looped playback seamless."""
+    # Durations are float32 seconds: 0.9333334 s * 30 fps lands on frame 29.000002, which is frame 29
+    nearest = round(action.frame_end)
+    end = int(nearest) if abs(action.frame_end - nearest) < 1e-3 else int(math.ceil(action.frame_end))
+    if action.use_cyclic and end - 1 > int(action.frame_start):
+        end -= 1
+    return max(int(action.frame_start), end)
 
 
 def build_action(
@@ -353,11 +390,18 @@ def build_action(
     action_name: str = "",
     push_to_nla: bool = True,
     set_scene_range: bool = True,
+    loop: Optional[bool] = None,
 ) -> bpy.types.Action:
     """Create a Blender 5.2 Slotted Action on `armature_obj` from a Gr2Animation.
 
     Keys are generated with NumPy per bone track (see `track_key_times`), grouped per bone, and the
     action gets a manual frame range (and cyclic flag for looping clips) for NLA / Action Editor use.
+
+    `loop` says whether the clip cycles; the game's .anm `loop_count` is authoritative. When None, a clip
+    loops if its Granny DefaultLoopCount is 0 (loop forever) and its end pose returns to its start pose
+    (`clip_is_closed`), since MA2 exports leave DefaultLoopCount at 0 on one-shot clips too.
+    Looping clips are sampled periodically (see `loop_curve`): the last key equals the first, and
+    each F-curve gets a Cycles modifier so playback wraps without a seam.
     """
     clip_name = action_name or anim.name or "MA2_Animation"
     action = bpy.data.actions.new(name=clip_name)
@@ -381,6 +425,9 @@ def build_action(
             skel_rest_by_lower[sb.name.lower()] = sb.local_transform
 
     duration = max(0.0, anim.duration)
+    if loop is None:
+        loop = anim.default_loop_count == 0 and clip_is_closed(anim)
+    cyclic = bool(loop) and duration > 0.0
     sample_fps = fps if fps > 0.0 else (1.0 / anim.time_step if anim.time_step > 0.0 else 30.0)
 
     for tg in anim.track_groups:
@@ -406,13 +453,21 @@ def build_action(
             times, interpolation = track_key_times(
                 (track.position, track.orientation, track.scale_shear), duration, sample_fps
             )
-            pos = evaluate_curve_np(track.position, times, s_rest.position)
-            rot = evaluate_curve_np(track.orientation, times, s_rest.orientation)
-            ss = evaluate_curve_np(track.scale_shear, times, s_rest.scale_shear)
+            if cyclic:
+                pos_c, rot_c, ss_c = (loop_curve(c, duration) for c in (track.position, track.orientation, track.scale_shear))
+            else:
+                pos_c, rot_c, ss_c = track.position, track.orientation, track.scale_shear
+            pos = evaluate_curve_np(pos_c, times, s_rest.position)
+            rot = evaluate_curve_np(rot_c, times, s_rest.orientation)
+            ss = evaluate_curve_np(ss_c, times, s_rest.scale_shear)
 
             basis = left @ gr2_trs_to_blender_np(pos, rot, ss, world_scale=scale, axes=axes) @ right
             locs, quats, scales = decompose_np(basis)
             quats = make_quats_continuous(quats)
+            if cyclic and times.size > 1 and abs(times[-1] - duration) < 1e-6 and abs(times[0]) < 1e-6:
+                # Close the cycle exactly (periodic sampling already matches to float precision)
+                locs[-1], scales[-1] = locs[0], scales[0]
+                quats[-1] = quats[0] * (1.0 if np.dot(quats[-1], quats[0]) >= 0.0 else -1.0)
 
             frames = 1.0 + times * sample_fps
             bone_path = f'pose.bones["{bpy.utils.escape_identifier(bname)}"]'
@@ -420,7 +475,7 @@ def build_action(
                 for idx in range(values.shape[1]):
                     _write_fcurve(
                         action, armature_obj, f"{bone_path}.{prop}", idx, bname,
-                        frames, values[:, idx], interpolation,
+                        frames, values[:, idx], interpolation, cyclic,
                     )
 
     # Manual frame range for the Action Editor / NLA, flagged cyclic for looping clips
@@ -428,8 +483,7 @@ def build_action(
     action.use_frame_range = True
     action.frame_end = max(frame_end, 1.0)
     action.frame_start = 1.0
-    # Granny DefaultLoopCount: 0 = loop forever
-    action.use_cyclic = anim.default_loop_count == 0 and duration > 0.0
+    action.use_cyclic = cyclic
 
     if set_scene_range:
         scene = bpy.context.scene
@@ -437,7 +491,7 @@ def build_action(
         scene.render.fps = fps_int
         scene.render.fps_base = fps_int / sample_fps
         scene.frame_start = 1
-        scene.frame_end = max(1, int(math.ceil(frame_end - 1e-6)))
+        scene.frame_end = playback_end_frame(action)
 
     if push_to_nla:
         track_nla = armature_obj.animation_data.nla_tracks.new()

@@ -13,7 +13,7 @@ from ..formats.gr2 import Gr2Skeleton, parse_gr2
 from ..formats.mgf import AssetSource
 from ..formats.model import ModelDef, SubMeshDef
 from ..formats.text_utils import file_stem, normalize_path
-from .animation_builder import build_action, build_armature
+from .animation_builder import build_action, build_armature, playback_end_frame
 from .coord import (
     mat4_row_to_blender,
     normals_to_blender_np,
@@ -380,6 +380,8 @@ def build_model_in_blender(
                         scale=settings.scale,
                         action_name=clip.name or anim.name,
                         set_scene_range=False,
+                        # .anm loop_count: -1 loops forever, N > 0 plays N times, 0 = unspecified
+                        loop=True if clip.loop_count < 0 else (False if clip.loop_count > 0 else None),
                     )
                     if active is None or clip is preferred:
                         active = action
@@ -395,6 +397,6 @@ def build_model_in_blender(
                 scene.render.fps = fps_int
                 scene.render.fps_base = fps_int / settings.fps
             scene.frame_start = int(active.frame_start)
-            scene.frame_end = max(scene.frame_start, int(math.ceil(active.frame_end - 1e-6)))
+            scene.frame_end = playback_end_frame(active)
 
     return root_obj

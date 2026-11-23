@@ -243,7 +243,27 @@ def test_max_space_rig_and_rigid_parts() -> None:
     swing = Matrix.Translation((0.0, 0.0, 5.0)) @ Matrix.Rotation(math.pi / 2.0, 4, "Z") @ Matrix.Translation((0.0, 0.0, -5.0))
     assert np.allclose(np.array(part.matrix_world), np.array(swing @ part_rest), atol=1e-3), part.matrix_world
     assert act.frame_end == 31.0
-    print("[PASS] 3ds Max-space GR2 rig, legacy curves & bone-parented rigid parts")
+    # DefaultLoopCount is 0 ("loop forever") but the swing doesn't return to its start: not a loop
+    assert not act.use_cyclic
+
+    # An explicitly looping clip (.anm loop_count -1) closes the cycle and wraps via Cycles modifiers
+    from io_scene_mechassault2.importers.animation_builder import playback_end_frame
+    loop_act = build_action(arm, gr2.animations[0], skeleton=skel, fps=30.0, action_name="SwingLoop", loop=True)
+    assert loop_act.use_cyclic
+    fcurves = get_action_fcurves(loop_act, loop_act.slots[0])
+    keyed = [fc for fc in fcurves if len(fc.keyframe_points) > 1]  # single-key channels are constant
+    assert keyed and all(any(m.type == "CYCLES" for m in fc.modifiers) for fc in keyed)
+    assert playback_end_frame(loop_act) == 30 and scene.frame_end == 30, (playback_end_frame(loop_act), scene.frame_end)
+    poses = {}
+    for f in (1, 31, 46):
+        scene.frame_set(f)
+        bpy.context.view_layer.update()
+        poses[f] = np.array(part.matrix_world)
+    assert np.allclose(poses[31], poses[1], atol=1e-4), "frame 31 must repeat frame 1"
+    scene.frame_set(16)
+    bpy.context.view_layer.update()
+    assert np.allclose(poses[46], np.array(part.matrix_world), atol=1e-4), "Cycles modifier must wrap past the range"
+    print("[PASS] 3ds Max-space GR2 rig, legacy curves, rigid parts & seamless loops")
 
 
 def test_vectorized_transforms_match_mathutils() -> None:

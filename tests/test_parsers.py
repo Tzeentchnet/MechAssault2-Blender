@@ -21,7 +21,7 @@ from io_scene_mechassault2.formats.geometry import (
     decode_vertex_file,
     vertex_stride,
 )
-from io_scene_mechassault2.formats.gr2 import Gr2Curve, evaluate_curve, evaluate_curve_np, parse_gr2
+from io_scene_mechassault2.formats.gr2 import Gr2Curve, evaluate_curve, evaluate_curve_np, loop_curve, parse_gr2
 from io_scene_mechassault2.formats.index_cache import (
     clear_index_cache,
     load_cached_index,
@@ -351,6 +351,27 @@ class TestGranny2(unittest.TestCase):
         self.assertEqual((hip.orientation.degree, hip.orientation.dimension), (1, 4))
         q_end = evaluate_curve(hip.orientation, 1.0, (0.0, 0.0, 0.0, 1.0))
         np.testing.assert_allclose(q_end, (0.0, 0.0, math.sin(math.pi / 4.0), math.cos(math.pi / 4.0)), atol=1e-6)
+
+    def test_loop_curve_wraps_across_seam(self) -> None:
+        # A degree-2 cycle keyed on frames 0..N inclusive whose last control misses the first slightly,
+        # like the shipped walk/run clips
+        duration = 1.2
+        knots = tuple(float(k) for k in np.linspace(0.0, duration, 13))
+        controls = tuple((math.sin(2.0 * math.pi * k / duration) + (0.05 if i == 12 else 0.0),) for i, k in enumerate(knots))
+        curve = Gr2Curve(codec="test", fmt=0, degree=2, dimension=1, knots=knots, controls=controls)
+        looped = loop_curve(curve, duration)
+        t = np.linspace(0.0, duration, 37)
+        clamped_v = evaluate_curve_np(curve, t, (0.0,))[:, 0]
+        looped_v = evaluate_curve_np(looped, t, (0.0,))[:, 0]
+        self.assertGreater(abs(clamped_v[-1] - clamped_v[0]), 0.01)
+        self.assertAlmostEqual(looped_v[-1], looped_v[0], places=9)
+        # Seam step (last played frame -> first) is no bigger than the normal frame-to-frame motion
+        steps = np.abs(np.diff(looped_v[:-1]))
+        self.assertLessEqual(abs(looped_v[0] - looped_v[-2]), steps.max() * 1.05)
+        # Constant and missing curves pass through unchanged
+        const = Gr2Curve(codec="test", fmt=0, degree=0, dimension=3, constant_value=(1.0, 2.0, 3.0))
+        self.assertIs(loop_curve(const, duration), const)
+        self.assertIsNone(loop_curve(None, duration))
 
     def test_evaluate_curve_np_matches_scalar(self) -> None:
         rng = np.random.default_rng(1234)

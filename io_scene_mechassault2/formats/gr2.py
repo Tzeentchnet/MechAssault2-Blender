@@ -1244,6 +1244,40 @@ def evaluate_curve_np(
     return res
 
 
+def loop_curve(curve: Optional[Gr2Curve], duration: float) -> Optional[Gr2Curve]:
+    """Return `curve` extended periodically over `duration`, as Granny samples looping clips.
+
+    Exporters key a loop on frames 0..N inclusive, so a final knot at `duration` duplicates the
+    first one and is dropped. The control window then wraps past either end into the other end of
+    the cycle, so the curve is smooth across the seam and evaluates identically at 0 and `duration`.
+    Constant, single-key or degenerate curves are returned unchanged.
+    """
+    if curve is None or curve.constant_value or duration <= 0.0:
+        return curve
+    knots = list(curve.knots)
+    controls = list(curve.controls)
+    n = min(len(knots), len(controls))
+    if n < 2:
+        return curve
+    knots, controls = knots[:n], controls[:n]
+    if abs(knots[-1] - duration) <= 1e-4 * max(1.0, duration) and n > 2:
+        knots, controls = knots[:-1], controls[:-1]
+        n -= 1
+    if knots[0] < -1e-6 or knots[-1] >= duration:
+        return curve
+    m = min(n, max(0, curve.degree) + 2)
+    ext_knots = [k - duration for k in knots[n - m:]] + knots + [k + duration for k in knots[:m]]
+    ext_controls = controls[n - m:] + controls + controls[:m]
+    return Gr2Curve(
+        codec=curve.codec,
+        fmt=curve.fmt,
+        degree=curve.degree,
+        dimension=curve.dimension,
+        knots=tuple(ext_knots),
+        controls=tuple(ext_controls),
+    )
+
+
 def parse_gr2(data: bytes) -> Gr2File:
     """Parse a Granny2 .gr2 file (uncompressed or Oodle0/Oodle1 compressed)."""
     return _Gr2Reader(data).parse()
