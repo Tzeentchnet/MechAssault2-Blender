@@ -2,6 +2,20 @@
 
 A zero-external-dependency **Blender 5.2 Extension** (`io_scene_mechassault2`) for importing **MechAssault 2: Lone Wolf** models, materials, textures, skeletons, animations, and full maps directly from Xbox `.iso` / `.xiso.iso` disc images, `.mgf` archives, or extracted files on disk.
 
+## Screenshots
+
+![Asset browser in the 3D Viewport sidebar](docs/images/ma2_interface.png)
+*The MechAssault 2 sidebar: scan a disc image, filter, and import.*
+
+![Imported map](docs/images/ma2_map_example.png)
+*A full map imported from a `.wdf`.*
+
+![Animated mech](docs/images/ma2_mechanimation.png)
+*A rigged mech with a Granny2 animation applied.*
+
+![Animated character](docs/images/ma2_characteraniation.png)
+*A character skin bound to its rig and animated.*
+
 ## Documentation
 
 - [Features](docs/features.md): what the extension imports.
