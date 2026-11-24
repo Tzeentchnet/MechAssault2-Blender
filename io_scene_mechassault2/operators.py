@@ -11,6 +11,7 @@ from bpy_extras.io_utils import ImportHelper
 
 from .formats.gr2 import parse_gr2
 from .formats.index_cache import (
+    BROWSER_CATEGORIES,
     SourceIndex,
     clear_index_cache,
     load_cached_index,
@@ -134,7 +135,7 @@ class IMPORT_SCENE_OT_ma2_model(bpy.types.Operator, ImportHelper):
             bpy.context.view_layer.objects.active = root_obj
             for w in mdef.warnings[:10]:
                 self.report({"WARNING"}, w)
-            self.report({"INFO"}, f"Imported {mdef.path} ({len(mdef.meshes)} sub-meshes)")
+            self.report({"INFO"}, f"Imported {mdef.path} ({len(mdef.meshes)} sub-meshes){_rig_note(mdef)}")
             return {"FINISHED"}
         except Exception as exc:
             self.report({"ERROR"}, f"Failed to import model: {exc}")
@@ -298,6 +299,11 @@ class IMPORT_IMAGE_OT_ma2_texture(bpy.types.Operator, ImportHelper):
 _RESTORING_BROWSER = False
 
 
+def _rig_note(mdef) -> str:
+    """Report suffix naming the .NODE a model's rig was borrowed from, if it was."""
+    return f"; rig and clips from {mdef.wrapper_path}" if mdef.wrapper_path else ""
+
+
 def _browser_archive_paths(context: bpy.types.Context) -> Optional[Path]:
     props = context.scene.ma2_browser
     if props.game_files_dir:
@@ -328,6 +334,7 @@ def populate_browser_from_index(props, idx: SourceIndex, from_cache: bool) -> No
             item.resource_missing = not m.resource_present
     else:
         records = {
+            "MECHS": idx.mechs,
             "MODELS": idx.models,
             "ANIMATIONS": idx.animations,
             "TEXTURES": idx.textures,
@@ -359,7 +366,7 @@ def restore_browser_from_cache(scene: Optional[bpy.types.Scene] = None) -> bool:
         st = load_state()
         if not props.game_files_dir and st.last_source and Path(st.last_source).exists():
             props.game_files_dir = st.last_source
-            if st.last_category in ("MAPS", "MODELS", "ANIMATIONS", "TEXTURES"):
+            if st.last_category in BROWSER_CATEGORIES:
                 props.category = st.last_category
         elif not props.game_files_dir:
             prefs = get_preferences()
@@ -489,6 +496,7 @@ class MA2_OT_import_browser_item(bpy.types.Operator):
                 aset = open_game_archives(target, level_mgf=item.archive_name or None)
                 source = AssetSource(archive_set=aset)
 
+            note = ""
             if item.kind == "MAPS":
                 catalog = TemplateCatalog.from_source(source)
                 mdata = load_map(
@@ -508,8 +516,9 @@ class MA2_OT_import_browser_item(bpy.types.Operator):
                         pack_textures=props.pack_textures,
                     ),
                 )
-            elif item.kind == "MODELS":
+            elif item.kind in ("MECHS", "MODELS"):
                 mdef = load_model(source, item.path, ModelLoadOptions(apply_mtb=props.apply_mtb))
+                note = _rig_note(mdef)
                 tex_lib = TextureLibrary(source, pack=props.pack_textures)
                 build_model_in_blender(
                     mdef,
@@ -538,7 +547,7 @@ class MA2_OT_import_browser_item(bpy.types.Operator):
                 if rgba is not None:
                     rgba_to_blender_image(file_name(item.path), rgba, pack=props.pack_textures)
 
-            self.report({"INFO"}, f"Imported {item.path}")
+            self.report({"INFO"}, f"Imported {item.path}{note}")
             return {"FINISHED"}
         except Exception as exc:
             self.report({"ERROR"}, f"Import failed: {exc}")

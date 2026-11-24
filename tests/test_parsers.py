@@ -23,7 +23,10 @@ from io_scene_mechassault2.formats.geometry import (
 )
 from io_scene_mechassault2.formats.gr2 import Gr2Curve, evaluate_curve, evaluate_curve_np, loop_curve, parse_gr2
 from io_scene_mechassault2.formats.index_cache import (
+    CachedAssetItem,
+    build_source_index,
     clear_index_cache,
+    disambiguate_names,
     load_cached_index,
     load_state,
     scan_or_load_index,
@@ -47,6 +50,7 @@ from io_scene_mechassault2.formats.mgic_texture import (
 from io_scene_mechassault2.formats.model import (
     AlphaMode,
     ModelLoadOptions,
+    find_wrapping_nodes,
     load_model,
     parse_animation_set,
 )
@@ -300,6 +304,96 @@ class TestWdfAndModel(unittest.TestCase):
                 self.assertEqual(xml_clips[0].name, "anim_idle")
             finally:
                 archives.close()
+
+
+def _mech_archive_files() -> dict:
+    """A shipped-style mech folder: .NODE wrappers beside the geometry that names no skeleton."""
+    geo = b'<model><node_generic name="joint_root" position="0,0,0"/></model>'
+
+    def wrapper(child: str, clips: list) -> bytes:
+        text = (
+            '[node]\ntype = ANIMNODE\nname = "Cat animation"\nnum_children = 1\n'
+            f'child = "{child}"\nskeleton = "animations/cat_skeleton.gr2"\n'
+        )
+        for i, c in enumerate(clips, 1):
+            text += f'[animation{i}]\nname = "{c}"\nanimation = "animations/cat_{c}.gr2"\nloop_count = -1\n'
+        return text.encode()
+
+    return {
+        "Models/Mechs/Heavy/Cat/cat.NODE": wrapper("model/cat.mgmodel", ["base", "walk"]),
+        "Models/Mechs/Heavy/Cat/cat_low.NODE": wrapper("model_low/cat.mgmodel", ["base"]),
+        "Models/Mechs/Heavy/Cat/cat_cinema_a.NODE": wrapper("model/cat_cinema.mgmodel", ["base"]),
+        "Models/Mechs/Heavy/Cat/cat_cinema_b.NODE": wrapper("model/cat_cinema.mgmodel", ["base", "walk", "run"]),
+        "Models/Mechs/Heavy/Cat/Model/cat.mgmodel": geo,
+        "Models/Mechs/Heavy/Cat/model_low/cat.mgmodel": geo,
+        "Models/Mechs/Heavy/Cat/Model/cat_cinema.mgmodel": geo,
+        "Models/Mechs/Heavy/Cat/Model/cat_explode.MGMODEL": geo,
+        "Models/Props/Crate/crate.mgmodel": geo,
+        "Models/Props/Crate/Model/crate.mgmodel": geo,
+    }
+
+
+class TestMechWrappers(unittest.TestCase):
+    def test_mgmodel_borrows_skeleton_from_wrapping_node(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            mgf = Path(td) / "mechs.mgf"
+            mgf.write_bytes(build_mgf_v4(_mech_archive_files()))
+            archives = ArchiveSet()
+            archives.add(mgf)
+            try:
+                src = AssetSource(archive_set=archives)
+                m = load_model(src, "Models/Mechs/Heavy/Cat/Model/cat.mgmodel")
+                self.assertEqual(m.wrapper_path, "Models/Mechs/Heavy/Cat/cat.NODE")
+                self.assertEqual(m.skeleton, "Models/Mechs/Heavy/Cat/animations/cat_skeleton.gr2")
+                self.assertEqual([c.name for c in m.anim_clips], ["base", "walk"])
+                self.assertEqual(m.anim_clips[1].loop_count, -1)
+
+                low = load_model(src, "Models/Mechs/Heavy/Cat/model_low/cat.mgmodel")
+                self.assertEqual(low.wrapper_path, "Models/Mechs/Heavy/Cat/cat_low.NODE")
+
+                # Two cinematic wrappers share one model: the one with more clips wins
+                wraps = find_wrapping_nodes(src, "Models/Mechs/Heavy/Cat/Model/cat_cinema.mgmodel")
+                self.assertEqual([w.path for w in wraps], [
+                    "Models/Mechs/Heavy/Cat/cat_cinema_b.NODE",
+                    "Models/Mechs/Heavy/Cat/cat_cinema_a.NODE",
+                ])
+
+                # Unwrapped geometry stays unrigged, and the fallback can be turned off
+                self.assertEqual(load_model(src, "Models/Mechs/Heavy/Cat/Model/cat_explode.MGMODEL").skeleton, "")
+                off = load_model(src, "Models/Mechs/Heavy/Cat/Model/cat.mgmodel", ModelLoadOptions(use_wrapping_node=False))
+                self.assertEqual((off.skeleton, off.wrapper_path, off.anim_clips), ("", "", []))
+
+                # Loading the .NODE itself is unchanged
+                node = load_model(src, "Models/Mechs/Heavy/Cat/cat.NODE")
+                self.assertEqual(node.wrapper_path, "")
+                self.assertEqual(node.skeleton, "Models/Mechs/Heavy/Cat/animations/cat_skeleton.gr2")
+            finally:
+                archives.close()
+
+    def test_index_splits_and_dedupes_mechs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            mgf = Path(td) / "mechs.mgf"
+            mgf.write_bytes(build_mgf_v4(_mech_archive_files()))
+            idx = build_source_index(mgf)
+            self.assertEqual([(m.name, m.path) for m in idx.mechs], [
+                ("[Heavy] Cat", "Models/Mechs/Heavy/Cat/cat.NODE"),
+                ("[Heavy] Cat (cinema_a)", "Models/Mechs/Heavy/Cat/cat_cinema_a.NODE"),
+                ("[Heavy] Cat (cinema_b)", "Models/Mechs/Heavy/Cat/cat_cinema_b.NODE"),
+                ("[Heavy] Cat (explode)", "Models/Mechs/Heavy/Cat/Model/cat_explode.MGMODEL"),
+                ("[Heavy] Cat (low)", "Models/Mechs/Heavy/Cat/cat_low.NODE"),
+            ])
+            # Mechs leave the Models list; same-named models there get telling labels
+            self.assertEqual(sorted(m.name for m in idx.models), ["crate (Crate)", "crate (Model)"])
+            self.assertEqual(mgf.name, idx.mechs[0].archive_name)
+
+    def test_disambiguate_names_falls_back_to_differing_folders(self) -> None:
+        items = [
+            CachedAssetItem("x", "Models/A/Model/x.mgmodel", ""),
+            CachedAssetItem("x", "Models/B/Model/x.mgmodel", ""),
+            CachedAssetItem("y", "Models/y.mgmodel", ""),
+        ]
+        disambiguate_names(items)
+        self.assertEqual([i.name for i in items], ["x (A/Model)", "x (B/Model)", "y"])
 
 
 class TestGranny2(unittest.TestCase):

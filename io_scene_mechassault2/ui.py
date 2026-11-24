@@ -41,7 +41,8 @@ class MA2BrowserSettings(bpy.types.PropertyGroup):
         name="Category",
         items=[
             ("MAPS", "Maps", "Browse campaign and multiplayer maps"),
-            ("MODELS", "Models", "Browse .mgmodel and .node models"),
+            ("MECHS", "Mechs", "Browse mechs and power armor, one entry per variant, rigged where the game rigs them"),
+            ("MODELS", "Models", "Browse .mgmodel and .node models other than mechs"),
             ("ANIMATIONS", "Animations", "Browse .gr2 and .anm skeletons & animations"),
             ("TEXTURES", "Textures", "Browse MGIc .tif textures"),
         ],
@@ -131,7 +132,7 @@ class MA2_PT_browser_panel(bpy.types.Panel):
         box = layout.box()
         box.label(text="Import Options")
         box.prop(props, "scale")
-        if props.category == "MODELS":
+        if props.category in ("MECHS", "MODELS"):
             box.prop(props, "import_skeleton")
             box.prop(props, "import_animations")
             box.prop(props, "apply_mtb")

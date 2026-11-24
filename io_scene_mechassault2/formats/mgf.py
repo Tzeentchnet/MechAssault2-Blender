@@ -370,14 +370,8 @@ class AssetSource:
         return sorted(found.values())
 
 
-def resolve_model_path(source: AssetSource, path: str) -> str:
-    """Resolve a model path including _low and .NODE <-> .MGMODEL fallbacks."""
-    norm = normalize_path(path)
-    if not norm:
-        return ""
-    if source.exists(norm):
-        return source.canonical_path(norm)
-
+def model_path_fallbacks(norm: str) -> List[str]:
+    """The `_low` and .NODE <-> .MGMODEL stand-ins tried, in order, when model path `norm` is absent."""
     folder = folder_of(norm)
     stem = file_stem(norm)
     ext = extension(norm)
@@ -394,8 +388,18 @@ def resolve_model_path(source: AssetSource, path: str) -> str:
         other_up = other_ext.upper()
         candidates.append(f"{prefix}{stem}.{other_up}")
         candidates.append(f"{prefix}{stem}_low.{other_up}")
+    return candidates
 
-    for c in candidates:
+
+def resolve_model_path(source: AssetSource, path: str) -> str:
+    """Resolve a model path including _low and .NODE <-> .MGMODEL fallbacks."""
+    norm = normalize_path(path)
+    if not norm:
+        return ""
+    if source.exists(norm):
+        return source.canonical_path(norm)
+
+    for c in model_path_fallbacks(norm):
         if source.exists(c):
             return source.canonical_path(c)
     return ""

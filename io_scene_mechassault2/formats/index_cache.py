@@ -11,11 +11,19 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .map_wdf import MapEntry, discover_maps_from_common
-from .mgf import MGFArchive
-from .text_utils import file_stem
+from .mgf import MGFArchive, model_path_fallbacks
+from .model import read_anim_node
+from .text_utils import extension, file_name, file_stem, folder_of, normalize_path
 from .xiso import XisoArchive, is_xiso_file
 
-INDEX_SCHEMA_VERSION = 1
+# 2: adds the Mechs category and gives Models entries that share a file name distinct labels
+INDEX_SCHEMA_VERSION = 2
+
+BROWSER_CATEGORIES = ("MAPS", "MECHS", "MODELS", "ANIMATIONS", "TEXTURES")
+
+_MECHS_PREFIX = "models/mechs/"
+#: Weight classes in the order the Mechs list shows them; other folders (bosses' parts etc.) follow
+_MECH_CLASS_ORDER = ("light", "medium", "heavy", "assault", "boss", "powerarmor")
 
 
 @dataclass
@@ -58,6 +66,7 @@ class SourceIndex:
     models: List[CachedAssetItem] = field(default_factory=list)
     animations: List[CachedAssetItem] = field(default_factory=list)
     textures: List[CachedAssetItem] = field(default_factory=list)
+    mechs: List[CachedAssetItem] = field(default_factory=list)
 
 
 @dataclass
@@ -144,7 +153,7 @@ def load_state(cache_dir: Optional[Path] = None) -> BrowserState:
         if not isinstance(raw, dict):
             return BrowserState()
         cat = str(raw.get("last_category", "MAPS"))
-        if cat not in ("MAPS", "MODELS", "ANIMATIONS", "TEXTURES"):
+        if cat not in BROWSER_CATEGORIES:
             cat = "MAPS"
         recents = [str(x) for x in raw.get("recent_sources", []) if isinstance(x, str)]
         return BrowserState(
@@ -169,7 +178,7 @@ def record_last_source(
     resolved = str(_resolve_source_path(source_path))
     st = load_state(cache_dir)
     st.last_source = resolved
-    if category in ("MAPS", "MODELS", "ANIMATIONS", "TEXTURES"):
+    if category in BROWSER_CATEGORIES:
         st.last_category = category
     recents = [resolved] + [s for s in st.recent_sources if s != resolved]
     st.recent_sources = recents[:12]
@@ -209,6 +218,7 @@ def _index_from_dict(raw: Dict[str, Any]) -> SourceIndex:
         models=[CachedAssetItem(**a) for a in raw.get("models", [])],
         animations=[CachedAssetItem(**a) for a in raw.get("animations", [])],
         textures=[CachedAssetItem(**a) for a in raw.get("textures", [])],
+        mechs=[CachedAssetItem(**a) for a in raw.get("mechs", [])],
     )
 
 
@@ -260,6 +270,7 @@ def _collect_archive_assets(
     animations: List[CachedAssetItem],
     textures: List[CachedAssetItem],
     fallback_wdfs: List[CachedMapItem],
+    anim_node_children: List[str],
 ) -> None:
     for entry in ar.entries:
         p = entry.path
@@ -268,6 +279,11 @@ def _collect_archive_assets(
             if low not in seen_models:
                 seen_models.add(low)
                 models.append(CachedAssetItem(name=file_stem(p), path=p, archive_name=ar_label))
+                if low.endswith(".node"):
+                    try:
+                        anim_node_children.extend(read_anim_node(ar.read(p), p).children)
+                    except Exception:
+                        pass
         elif low.endswith((".gr2", ".anm")):
             if low not in seen_anims:
                 seen_anims.add(low)
@@ -290,6 +306,99 @@ def _collect_archive_assets(
                         resource_present=True,
                     )
                 )
+
+
+def _wrapped_model_paths(model_paths: set[str], anim_node_children: List[str]) -> set[str]:
+    """Lower-case paths of the models an ANIMNODE .NODE animates, matched the way the loader resolves them."""
+    wrapped: set[str] = set()
+    for child in anim_node_children:
+        norm = normalize_path(child)
+        for cand in [norm, *model_path_fallbacks(norm)]:
+            if cand.lower() in model_paths:
+                wrapped.add(cand.lower())
+                break
+    return wrapped
+
+
+def mech_label(path: str) -> Tuple[Tuple[Any, ...], str]:
+    """`(sort key, display name)` for a model under Models/Mechs, e.g. "[Heavy] NovaCat (low)".
+
+    Folders are Models/Mechs/<class>/<mech>/...; the variant is the file stem without the mech's name.
+    """
+    rel = normalize_path(path).split("/")[2:]
+    stem = file_stem(path)
+    if len(rel) >= 3:
+        group, mech = rel[0], rel[1]
+    else:
+        group, mech = "", (rel[0] if len(rel) == 2 else stem)
+    s_low, m_low = stem.lower(), mech.lower()
+    if s_low == m_low:
+        variant = ""
+    elif s_low.startswith(f"{m_low}_"):
+        variant = stem[len(mech) + 1:]
+    else:
+        variant = stem
+    name = f"[{group}] {mech}" if group else mech
+    if variant:
+        name += f" ({variant})"
+    g_low = group.lower()
+    order = _MECH_CLASS_ORDER.index(g_low) if g_low in _MECH_CLASS_ORDER else len(_MECH_CLASS_ORDER)
+    return (order, g_low, m_low, variant != "", variant.lower(), path.lower()), name
+
+
+def split_mech_models(
+    models: List[CachedAssetItem],
+    anim_node_children: List[str],
+) -> Tuple[List[CachedAssetItem], List[CachedAssetItem]]:
+    """Split `models` into `(mechs, everything else)`, one Mechs entry per importable variant.
+
+    A mech's rigged entry point is its .NODE; the .MGMODEL that .NODE wraps would import the same parts, so
+    it is left out. Mech models no .NODE wraps (explosion debris, powered-down set pieces) stay in.
+    """
+    wrapped = _wrapped_model_paths({m.path.lower() for m in models}, anim_node_children)
+    mechs: List[Tuple[Tuple[Any, ...], CachedAssetItem]] = []
+    rest: List[CachedAssetItem] = []
+    for m in models:
+        low = m.path.lower()
+        if not low.startswith(_MECHS_PREFIX):
+            rest.append(m)
+            continue
+        if low in wrapped:
+            continue
+        key, name = mech_label(m.path)
+        mechs.append((key, CachedAssetItem(name=name, path=m.path, archive_name=m.archive_name)))
+    mechs.sort(key=lambda kv: kv[0])
+    out = [it for _k, it in mechs]
+    disambiguate_names(out)
+    return out, rest
+
+
+def _variant_tag(path: str) -> str:
+    return "NODE" if extension(path) == "node" else (file_name(folder_of(path)) or extension(path).upper())
+
+
+def disambiguate_names(items: List[CachedAssetItem]) -> None:
+    """Give items that share a display name distinct ones, e.g. "novacat (NODE)" / "novacat (model_low)"."""
+    groups: Dict[str, List[CachedAssetItem]] = {}
+    for it in items:
+        groups.setdefault(it.name.lower(), []).append(it)
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        tags = [_variant_tag(it.path) for it in group]
+        if len({t.lower() for t in tags}) < len(tags):
+            # Same tag in different trees: name each by the folders that differ
+            folders = [folder_of(it.path).split("/") for it in group]
+            common = 0
+            while all(len(f) > common for f in folders) and len({f[common].lower() for f in folders}) == 1:
+                common += 1
+            tags = [
+                "/".join(f[common:]) + (" NODE" if extension(it.path) == "node" else "")
+                for f, it in zip(folders, group)
+            ]
+        for it, tag in zip(group, tags):
+            if tag.strip():
+                it.name = f"{it.name} ({tag.strip()})"
 
 
 def _convert_map_entries(entries: List[MapEntry]) -> List[CachedMapItem]:
@@ -322,6 +431,7 @@ def build_source_index(source_path: str | os.PathLike[str]) -> SourceIndex:
     seen_a: set[str] = set()
     seen_t: set[str] = set()
     seen_w: set[str] = set()
+    anim_node_children: List[str] = []
     iso_slices: List[IsoMgfSlice] = []
     iso_part_off = 0
 
@@ -357,6 +467,7 @@ def build_source_index(source_path: str | os.PathLike[str]) -> SourceIndex:
                         animations,
                         textures,
                         fallback_wdfs,
+                        anim_node_children,
                     )
     elif kind == "mgf":
         with MGFArchive(resolved) as ar:
@@ -373,6 +484,7 @@ def build_source_index(source_path: str | os.PathLike[str]) -> SourceIndex:
                 animations,
                 textures,
                 fallback_wdfs,
+                anim_node_children,
             )
     else:  # dir
         mgf_paths = sorted(resolved.glob("*.mgf"), key=lambda q: q.name.lower())
@@ -393,12 +505,15 @@ def build_source_index(source_path: str | os.PathLike[str]) -> SourceIndex:
                     animations,
                     textures,
                     fallback_wdfs,
+                    anim_node_children,
                 )
 
     if not maps and fallback_wdfs:
         fallback_wdfs.sort(key=lambda m: m.name.lower())
         maps = fallback_wdfs
 
+    mechs, models = split_mech_models(models, anim_node_children)
+    disambiguate_names(models)
     models.sort(key=lambda a: (a.name.lower(), a.path.lower()))
     animations.sort(key=lambda a: (a.name.lower(), a.path.lower()))
     textures.sort(key=lambda a: (a.name.lower(), a.path.lower()))
@@ -415,6 +530,7 @@ def build_source_index(source_path: str | os.PathLike[str]) -> SourceIndex:
         models=models,
         animations=animations,
         textures=textures,
+        mechs=mechs,
     )
 
 

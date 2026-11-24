@@ -13,6 +13,7 @@ from .geometry import VertexBuffer, build_triangles, decode_index_file, decode_v
 from .mgf import AssetSource, resolve_model_path
 from .mgic_texture import parse_mgic_picture_header, decode_mgic_texture
 from .text_utils import (
+    IniSection,
     XmlNode,
     extension,
     file_stem,
@@ -155,6 +156,8 @@ class ModelLoadOptions:
     apply_mtb: bool = True
     mtb_path: str = ""
     check_texture_alpha: bool = True
+    # A .MGMODEL names no skeleton: the .NODE wrapping it does. Borrow that wrapper's rig and clips.
+    use_wrapping_node: bool = True
 
 
 @dataclass
@@ -164,6 +167,8 @@ class ModelDef:
     geometry_path: str = ""
     mtb_path: str = ""
     skeleton: str = ""
+    # The ANIMNODE .NODE the skeleton and clips were taken from, when the model itself names none
+    wrapper_path: str = ""
     animations: List[str] = field(default_factory=list)
     anim_clips: List[AnimClipRef] = field(default_factory=list)
     nodes: List[NodeDef] = field(default_factory=list)
@@ -273,6 +278,92 @@ def parse_animation_set(raw_text: bytes | str, anm_path: str) -> List[AnimClipRe
                 seen.add(p.lower())
                 clips.append(AnimClipRef(name=file_stem(p), path=p))
     return clips
+
+
+def node_animation_clip(section: IniSection, node_path: str) -> Optional[AnimClipRef]:
+    """The clip an [animationN] section of a .NODE file declares, or None for any other section."""
+    if not section.name.lower().startswith("animation"):
+        return None
+    rel = section.get("animation", "") or ""
+    if not rel:
+        return None
+    path = resolve_relative(node_path, rel)
+    sp = parse_floats(section.get("synch_point", "0") or "0", 1)
+    lc = parse_floats(section.get("loop_count", "0") or "0", 1)
+    return AnimClipRef(
+        name=section.get("name", "") or file_stem(path),
+        path=path,
+        synch_point=sp[0] if sp else 0.0,
+        loop_count=int(lc[0]) if lc else 0,
+        primary=parse_bool(section.get("primary", "false") or "false", False),
+    )
+
+
+@dataclass
+class AnimNodeInfo:
+    """What a .NODE file's ANIMNODE sections declare: the skeleton, the models it animates, and its clips."""
+
+    path: str
+    skeleton: str = ""
+    children: List[str] = field(default_factory=list)  # resolved against the .NODE, not checked to exist
+    clips: List[AnimClipRef] = field(default_factory=list)
+
+
+def read_anim_node(raw: bytes | str, node_path: str) -> AnimNodeInfo:
+    """Read the ANIMNODE skeleton, child models and animation clips of the .NODE file `node_path`."""
+    info = AnimNodeInfo(path=node_path)
+    for s in parse_ini(raw):
+        clip = node_animation_clip(s, node_path)
+        if clip is not None:
+            info.clips.append(clip)
+            continue
+        if (s.get("type", "") or "").lower() != "animnode":
+            continue
+        sk = s.get("skeleton", "") or ""
+        if sk and not info.skeleton:
+            info.skeleton = resolve_relative(node_path, sk)
+        info.children.extend(resolve_relative(node_path, c) for c in s.get_all("child") if c)
+    return info
+
+
+def find_wrapping_nodes(source: AssetSource, model_path: str) -> List[AnimNodeInfo]:
+    """The skeleton-bearing .NODE files whose ANIMNODE animates `model_path`, best match first.
+
+    A mech's geometry (`NovaCat/Model/novacat.mgmodel`) names no skeleton or clips; the .NODE beside its
+    folder (`NovaCat/novacat.NODE`) wraps it and names both. Wrappers sit in the model's own folder or its
+    parent. Several may share one model (cinematic variants): prefer the one named like the model, then the
+    one with the most clips.
+    """
+    canon = source.canonical_path(model_path) or normalize_path(model_path)
+    target = canon.lower()
+    folder = folder_of(canon)
+    folders = {f.lower() for f in (folder, folder_of(folder)) if f}
+    if not folders:
+        return []
+
+    found: List[AnimNodeInfo] = []
+    seen: set[str] = set()
+    for f in folders:
+        for p in source.list_all(f"{f}/"):
+            pl = p.lower()
+            if pl in seen or pl == target or extension(p) != "node" or folder_of(p).lower() not in folders:
+                continue
+            seen.add(pl)
+            try:
+                info = read_anim_node(source.read(p), p)
+            except Exception:
+                continue
+            if not info.skeleton:
+                continue
+            for child in info.children:
+                resolved = resolve_model_path(source, child) or child
+                if resolved.lower() == target:
+                    found.append(info)
+                    break
+
+    stem = file_stem(canon).lower()
+    found.sort(key=lambda w: (file_stem(w.path).lower() != stem, -len(w.clips), w.path.lower()))
+    return found
 
 
 class _ModelAssembler:
@@ -446,6 +537,20 @@ class _ModelAssembler:
                     primary=primary,
                 )
             )
+
+    def _add_clip(self, clip: AnimClipRef) -> None:
+        self._add_anim_path(clip.path, clip.name, clip.synch_point, clip.loop_count, clip.primary)
+
+    def _adopt_wrapping_node(self) -> None:
+        """Take the skeleton and clips of the .NODE that wraps this model, when the model names none."""
+        wrappers = find_wrapping_nodes(self.source, self.model.path)
+        if not wrappers:
+            return
+        w = wrappers[0]
+        self.model.wrapper_path = w.path
+        self.model.skeleton = self.source.canonical_path(w.skeleton) or w.skeleton
+        for clip in w.clips:
+            self._add_clip(clip)
 
     def _read_animation_set(self, path: str) -> None:
         if not self.source.exists(path):
@@ -795,20 +900,9 @@ class _ModelAssembler:
                 sl = s.name.lower()
                 if sl == "fileinfo":
                     continue
-                if sl.startswith("animation") and s.get("animation"):
-                    a_rel = s.get("animation", "") or ""
-                    if a_rel:
-                        ap = resolve_relative(canon, a_rel)
-                        sp = parse_floats(s.get("synch_point", "0") or "0", 1)
-                        lc = parse_floats(s.get("loop_count", "0") or "0", 1)
-                        prim = parse_bool(s.get("primary", "false") or "false", False)
-                        self._add_anim_path(
-                            ap,
-                            name=s.get("name", "") or file_stem(ap),
-                            synch=sp[0] if sp else 0.0,
-                            loops=int(lc[0]) if lc else 0,
-                            primary=prim,
-                        )
+                clip = node_animation_clip(s, canon)
+                if clip is not None:
+                    self._add_clip(clip)
                     continue
                 secs.append(s)
 
@@ -1061,6 +1155,8 @@ class _ModelAssembler:
             self.model.warnings.append(f"resolved {path} as {canon}")
 
         self._load_any(canon, -1, 0)
+        if self.opts.use_wrapping_node and not self.model.skeleton:
+            self._adopt_wrapping_node()
         if self.opts.apply_mtb:
             mtb = normalize_path(self.opts.mtb_path) if self.opts.mtb_path else self._guess_mtb()
             if mtb:
